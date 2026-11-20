@@ -60,3 +60,21 @@ harvey.local.yaml
 # Backups and in-progress writes from `harvey train` hold the same config.
 harvey.local.yaml.*
 harvey.yaml.*
+
+# Archives, spreadsheets, reports, and scratch scripts (local-only)
+*.rar
+*.zip
+*.xlsx
+*.csv
+*.pdf
+*.log
+DATA LAPORAN MINGGUAN DARI WA/
+LAPORAN_MINGGUAN_*.md
+RENCANA_AKSI_*.md
+PLAN_PENGEMBANGAN_*.md
+scratch_*.py
+categorize_inbound.py
+list_all_inbound.py
+tools/
+scratch/
+harvey.yaml

@@ -66,7 +66,9 @@ class Prospect(BaseModel):
         return name
 
     def is_valid(self) -> bool:
-        """A contact must have a name and title — or be a company inbox with an address."""
+        """A contact must have a name and title/channel — or be a company inbox with an address."""
         if self.is_company_inbox:
             return bool(self.email and self.title)
-        return bool(self.first_name and self.last_name and self.title)
+        has_name = bool(self.first_name or self.last_name)
+        has_channel = bool(self.email or getattr(self, "phone", None))
+        return bool(has_name and (self.title or has_channel))

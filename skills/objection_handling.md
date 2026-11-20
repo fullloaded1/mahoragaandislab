@@ -108,3 +108,28 @@ These override every technique above. No framework justifies breaking them.
 4. **Never impersonate.** Don't claim a prior conversation that didn't happen, a referral that wasn't given, or a role/identity that isn't in the configured persona.
 5. **Anger means stop.** Hostile replies get no rebuttal and no clever reframe. Apologize briefly if warranted, suppress the contact, move on.
 6. **Legal/compliance objections end the thread.** "This is spam", "how did you get my email", "I'm reporting this" — respond once with a factual, apologetic note (data source + immediate removal), suppress, and flag for the human operator.
+
+---
+
+## Lab Procurement Objections (Indonesian Institutional Context)
+
+### 1. "Sudah ada rekanan / vendor tetap" (Existing Vendor)
+- **Principle**: Respect the incumbent relationship completely. Do not challenge or criticize their current vendor. Position as a complementary back-up for urgent ready-stock needs or comparative governance documentation.
+- **Response**:
+  > *"Completely understand, Pak Budi. Most established labs have long-term vendor partnerships. We often support teams simply as a secondary source when an item faces long indent times, or to provide formal comparison SPH documents for internal audit compliance. Whenever that is needed, we are happy to assist."*
+
+### 2. "Anggaran belum turun / belum ada anggaran" (Budget Pending or Not Allocated)
+- **Principle**: Public institutions and corporations follow strict budgeting cycles (RKA kampus, APBN/APBD lelang, RKAP pabrik). Do not pressure for a purchase date. Offer planning and documentation assistance with zero purchase commitment.
+- **Response**:
+  > *"Understood, Pak Budi. When your team begins drafting the next budget proposal, would it be helpful if we send indicative HPS benchmarks and technical spec sheets to assist the planning process? No obligation at all."*
+
+### 3. "Pengadaan wajib lewat e-Katalog / LPSE" (Tender / Government Catalog Requirement)
+- **Principle**: Validate compliance readiness immediately. Reassure the prospect that all administrative requirements (INAPROC e-Katalog, SPH resmi, Faktur Pajak, BAST) are standard procedure.
+- **Response**:
+  > *"Very clear, Pak Budi. All our equipment lines can be transacted through e-Katalog INAPROC and formal tender channels with complete tax invoices and official BAST. We are glad to coordinate directly with your PPK or procurement team whenever the package is opened."*
+
+### 4. Nurture Strategy for "Belum Butuh" (Timing Delay)
+- **Acknowledge and Step Back**: Never push back against "belum butuh". Thank them sincerely and pause active outbound.
+- **Set Long-Horizon Nurture**: Tag the account for reconnection 3-6 months later or ahead of the next fiscal planning cycle (e.g., Q3 for year-end absorption).
+- **Pure-Value Reconnection**: During the nurture pause, never send unsolicited sales pitches. Only share genuine, non-commercial reference materials (e.g., an annual lab equipment maintenance checklist or calibration guideline).
+

@@ -825,8 +825,18 @@ class Brain:
             return ""
         for key, value in kwargs.items():
             template = template.replace(f"{{{{{key}}}}}", str(value))
-        # Surface templating mistakes early instead of sending {{foo}} to Claude
-        leftover = re.findall(r"\{\{(\w+)\}\}", template)
+        # Surface templating mistakes early instead of sending {{foo}} to Claude/Gemini.
+        # Merge variables like {{first_name}}, {{company}}, {{title}} in the writer prompt
+        # are intentional output instructions for campaign templates, not unfilled input variables.
+        allowed_unfilled = (
+            {"first_name", "last_name", "company", "title", "personalization"}
+            if prompt_name == "writer"
+            else set()
+        )
+        leftover = [
+            var for var in re.findall(r"\{\{(\w+)\}\}", template)
+            if var not in allowed_unfilled
+        ]
         if leftover:
             logger.warning(
                 f"Prompt '{prompt_name}' has unfilled variables: {sorted(set(leftover))}"
@@ -855,10 +865,11 @@ class Brain:
         # and loaded by every agent that needs product context
         skill_map = {
             "scout": ["prospecting_tactics", "lead_qualification", "account_navigation", "signal_playbook", "product_knowledge"],
-            "writer": ["email_frameworks", "signal_playbook", "sales_methodology", "offer_strategy", "product_knowledge", "competitive_intel"],
-            "handler": ["objection_handling", "sales_methodology", "offer_strategy", "product_knowledge", "competitive_intel"],
+            "writer": ["email_frameworks", "signal_playbook", "sales_methodology", "offer_strategy", "product_knowledge", "competitive_intel", "humanizer"],
+            "handler": ["objection_handling", "sales_methodology", "offer_strategy", "product_knowledge", "competitive_intel", "referral_playbook", "humanizer"],
             "sender": ["email_frameworks", "product_knowledge"],
             "linkedin": ["linkedin_outreach", "prospecting_tactics", "product_knowledge"],
+            "whatsapp": ["whatsapp_style", "product_knowledge", "objection_handling", "humanizer"],
         }
 
         skill_names = skill_map.get(agent_name, [])

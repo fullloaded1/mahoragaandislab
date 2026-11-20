@@ -720,7 +720,10 @@ async def verify_published_address(email: str, env=None) -> str:
     if not mx_host:
         return "invalid"
     status, _ = await _verify_candidate(email, classify_mx(mx_host), env)
-    return status or "guess"
+    # When an email is explicitly published on the company's own website and the
+    # domain has a valid MX record, treat inconclusive (None) verification as
+    # "risky" rather than "guess" so it can be reached when send_to_risky=True.
+    return status or "risky"
 
 
 def _belongs_to_someone_else(candidate, pattern, person, domain, other_people, known_emails) -> bool:

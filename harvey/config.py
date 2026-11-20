@@ -11,7 +11,7 @@ import yaml
 from harvey.textio import read_user_text
 from dotenv import load_dotenv
 from pydantic import (
-    BaseModel, PrivateAttr, TypeAdapter, ValidationError, field_validator, model_validator,
+    BaseModel, Field, PrivateAttr, TypeAdapter, ValidationError, field_validator, model_validator,
 )
 
 from harvey.paths import PROJECT_ROOT
@@ -289,9 +289,41 @@ class LinkedInChannelConfig(BaseModel):
     max_daily_messages: int = 10
 
 
+class WhatsAppChannelConfig(BaseModel):
+    enabled: bool = False
+    provider: str = "web"           # "web" (WhatsApp Web via Chrome) or "fonnte" (Fonnte API)
+    max_daily_messages: int = 30    # Optimal anti-ban daily throughput for warmed-up numbers (~4-5/hr)
+    max_per_cycle: int = 1          # 1 message per 15-min cycle = ~4-5 messages/hour evenly paced
+    min_delay_seconds: int = 60     # Minimum human typing delay between messages
+    max_delay_seconds: int = 150    # Maximum human typing delay between messages
+    work_hours_start: str = "08:30" # Only send WA during Indonesian business hours
+    work_hours_end: str = "16:45"
+    warm_only: bool = False         # When True, only message contacts with existing WA notes
+    report_phone: str = "087764021131"  # Daily report recipient phone number
+    report_time: str = "17:00"          # Daily report time (HH:MM, WIB)
+    auto_report: bool = True            # Send automated end-of-day summary report
+    followup_enabled: bool = True       # Day-3 flyer + day-7 closing question (max 2 follow-ups)
+    followup_since: str = "2026-11-03"  # Only follow up chats first sent on/after this date
+    followup1_after_days: int = 3
+    followup2_after_days: int = 7
+    flyer_path: str = "data/promo_akhir_tahun_2026.jpg"
+    inbound_scan_enabled: bool = True   # Read WhatsApp Web chat list for replies (does not open chats)
+    reply_hours_start: str = "07:00"    # Extended hours for answering client inquiries
+    reply_hours_end: str = "21:00"      # Extended hours for answering client inquiries
+    auto_reply_mode: str = "full_auto"  # "full_auto" (auto-reply all non-optout inquiries), "safe", "draft", or "off"
+    openwa_base_url: str = "http://localhost:2785"
+    openwa_api_key: str = ""
+    openwa_session_id: str = "default"
+    quote_followup_enabled: bool = False  # Auto follow-up for sent SPH quotes (review preview CSV first)
+    quote_preview_path: str = "data/quote_followup_preview.csv"
+    quote_stage1_after_days: int = 2
+    quote_stage2_after_days: int = 6
+
+
 class ChannelsConfig(BaseModel):
     email: EmailChannelConfig = EmailChannelConfig()
     linkedin: LinkedInChannelConfig = LinkedInChannelConfig()
+    whatsapp: WhatsAppChannelConfig = WhatsAppChannelConfig()
 
 
 PRECLEARED_ADDRESS_SOURCES = ("published", "bought", "scraped", "given", "unknown")
@@ -391,6 +423,10 @@ class ComplianceConfig(BaseModel):
     # Must ask for wording Harvey recognises as an opt-out (OPT_OUT_WORDS).
     # "" leaves it off (and harvey warns).
     opt_out_line: str = DEFAULT_OPT_OUT_LINE
+    # Do-Not-Contact / Partner exclusions: never send outreach to these partners/companies
+    partner_exclusions: list[str] = Field(
+        default_factory=lambda: ["batavia", "kuku", "andis kukuh", "cmsi", "cahayatiara"]
+    )
 
     @field_validator("postal_address", "opt_out_line", mode="before")
     @classmethod
@@ -451,6 +487,24 @@ def compliance_notice(config) -> str:
         "(CAN-SPAM) requires both in every cold email. Set them in harvey.yaml "
         "(or harvey.local.yaml if you trained Harvey)."
     )
+
+
+def is_partner_or_excluded(
+    name: str = "",
+    company: str = "",
+    email: str = "",
+    phone: str = "",
+    config=None,
+) -> bool:
+    """Check if a prospect or company matches the partner / do-not-outreach blacklist."""
+    defaults = ["batavia", "kukuh", "andis kukuh", "cmsi", "cahayatiara"]
+    exclusions = defaults
+    if config:
+        compliance = getattr(config, "compliance", None)
+        if compliance and hasattr(compliance, "partner_exclusions") and compliance.partner_exclusions:
+            exclusions = list(set(defaults + [x.lower().strip() for x in compliance.partner_exclusions if x.strip()]))
+    haystack = f"{name} {company} {email} {phone}".lower()
+    return any(ex in haystack for ex in exclusions if ex)
 
 
 class QuietHoursConfig(BaseModel):
@@ -526,7 +580,7 @@ class BrainConfig(BaseModel):
     @model_validator(mode="after")
     def _default_gemini_model(self):
         if self.provider == "gemini" and not self.model:
-            self.model = "gemini-2.5-flash"
+            self.model = "gemini-3.8-flash"
         return self
 
     @field_validator("provider", mode="before")
@@ -612,6 +666,14 @@ class EnvConfig(BaseModel):
     precleared_api_key: str = ""
     # Brain Provider (Gemini)
     gemini_api_key: str = ""
+    # Optional WhatsApp Gateway (Fonnte / OpenWA)
+    fonnte_api_key: str = ""
+    openwa_base_url: str = ""
+    openwa_api_key: str = ""
+    openwa_session_id: str = ""
+    # Sourcing & Deep Search (By Request)
+    firecrawl_api_key: str = ""
+    tavily_api_key: str = ""
 
 
 def _format_validation_error(e: ValidationError) -> str:
@@ -726,6 +788,12 @@ def load_env() -> EnvConfig:
         m365_tenant_id=os.getenv("M365_TENANT_ID", "").strip(),
         precleared_api_key=os.getenv("PRECLEARED_API_KEY", "").strip(),
         gemini_api_key=(os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or "").strip(),
+        fonnte_api_key=os.getenv("FONNTE_API_KEY", "").strip(),
+        openwa_base_url=os.getenv("OPENWA_BASE_URL", "").strip(),
+        openwa_api_key=os.getenv("OPENWA_API_KEY", "").strip(),
+        openwa_session_id=os.getenv("OPENWA_SESSION_ID", "").strip(),
+        firecrawl_api_key=os.getenv("FIRECRAWL_API_KEY", "").strip(),
+        tavily_api_key=os.getenv("TAVILY_API_KEY", "").strip(),
     )
     return env
 

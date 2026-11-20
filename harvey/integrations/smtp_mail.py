@@ -38,6 +38,8 @@ class SmtpImapProvider(MailProvider):
 
     def __init__(self, config, env):
         self.config = config
+        self.env = env
+        self._last_auth_alert_ts = 0.0
         self.smtp_host = getattr(env, "smtp_host", "")
         self.smtp_port = int(getattr(env, "smtp_port", 587) or 587)
         self.smtp_user = getattr(env, "smtp_username", "")
@@ -46,6 +48,42 @@ class SmtpImapProvider(MailProvider):
         self.imap_port = int(getattr(env, "imap_port", 993) or 993)
         self.imap_user = getattr(env, "imap_username", "") or self.smtp_user
         self.imap_pass = getattr(env, "imap_password", "") or self.smtp_pass
+
+    async def _alert_operator_auth_failed(self, service: str, error_msg: str):
+        import time
+        now = time.time()
+        # Throttle: at most once every 3 hours
+        if now - getattr(self, "_last_auth_alert_ts", 0.0) < 10800:
+            return
+        self._last_auth_alert_ts = now
+        try:
+            from harvey.integrations.whatsapp import normalize_id_phone, OpenWAClient
+            operator_phone = "087764021131"
+            if hasattr(self.config, "channels") and hasattr(self.config.channels, "whatsapp"):
+                operator_phone = getattr(self.config.channels.whatsapp, "report_phone", None) or operator_phone
+            norm_op = normalize_id_phone(operator_phone)
+            if not norm_op:
+                return
+
+            base_url = getattr(self.env, "openwa_base_url", "http://localhost:2785")
+            api_key = getattr(self.env, "openwa_api_key", "")
+            session_id = getattr(self.env, "openwa_session_id", "default")
+            client = OpenWAClient(base_url=base_url, api_key=api_key, session_id=session_id)
+            if await client.check_health():
+                alert_text = (
+                    f"⚠️ *[ALERT SISTEM: KREDENSIAL EMAIL GAGAL]*\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"Layanan: *{service.upper()}*\n"
+                    f"Akun: *{self.smtp_user}*\n"
+                    f"Server: *{self.smtp_host}*\n"
+                    f"Penyebab: Autentikasi ditolak oleh server email (`{error_msg[:120]}`).\n\n"
+                    f"👉 *Solusi:*\n"
+                    f"Perbarui `SMTP_PASSWORD` / `IMAP_PASSWORD` di file `.env` dengan password webmail terbaru (atau buat App Password baru jika menggunakan Google/Outlook) agar pengiriman dan pengecekan email Harvey aktif kembali."
+                )
+                await client.send_text(norm_op, alert_text)
+                logger.info(f"SmtpImapProvider: WhatsApp alert sent to operator {norm_op} for {service} auth error.")
+        except Exception as e:
+            logger.debug(f"SmtpImapProvider: operator alert failed: {e}")
 
     def is_configured(self) -> bool:
         return bool(self.smtp_host and self.smtp_user and self.smtp_pass)
@@ -57,7 +95,10 @@ class SmtpImapProvider(MailProvider):
         body: str,
         thread_ref: str = "",
         in_reply_to: str = "",
+        attachments: list[str] | None = None,
     ) -> SendResult:
+        from pathlib import Path
+
         persona = self.config.persona
         msg = EmailMessage()
         msg["To"] = to_email
@@ -70,6 +111,17 @@ class SmtpImapProvider(MailProvider):
             msg["References"] = in_reply_to
         msg.set_content(body)
 
+        if attachments:
+            for att in attachments:
+                p = Path(att)
+                if p.exists() and p.is_file():
+                    msg.add_attachment(
+                        p.read_bytes(),
+                        maintype="application",
+                        subtype="pdf" if p.suffix.lower() == ".pdf" else "octet-stream",
+                        filename=p.name,
+                    )
+
         try:
             await aiosmtplib.send(
                 msg,
@@ -81,10 +133,24 @@ class SmtpImapProvider(MailProvider):
                 use_tls=(self.smtp_port == 465),
                 timeout=30,
             )
-        except Exception as e:
-            logger.error(f"SMTP send failed to {to_email}: {e}")
-            return SendResult(ok=False, error=str(e)[:300])
+        except Exception as first_err:
+            try:
+                import smtplib
+                await asyncio.to_thread(self._send_sync_fallback, msg)
+            except Exception as e:
+                logger.error(f"SMTP send failed to {to_email}: {first_err}")
+                err_str = f"{first_err} {e}".lower()
+                if any(k in err_str for k in ("auth", "535", "credentials", "password", "denied", "login")):
+                    await self._alert_operator_auth_failed("SMTP Outbound", str(first_err))
+                return SendResult(ok=False, error=str(first_err)[:300])
         return SendResult(ok=True, message_id=message_id, thread_ref=message_id)
+
+    def _send_sync_fallback(self, msg: EmailMessage) -> None:
+        import smtplib
+        pw = (self.smtp_pass or "").replace(" ", "")
+        with smtplib.SMTP_SSL(self.smtp_host, 465, timeout=25) as s:
+            s.login(self.smtp_user.strip(), pw)
+            s.send_message(msg)
 
     async def get_replies(self, limit: int = 50) -> list[InboundMessage]:
         loop = asyncio.get_event_loop()
@@ -92,6 +158,9 @@ class SmtpImapProvider(MailProvider):
             return await loop.run_in_executor(None, self._fetch_unseen, limit)
         except Exception as e:
             logger.error(f"IMAP fetch failed: {e}")
+            err_str = str(e).lower()
+            if any(k in err_str for k in ("auth", "authenticationfailed", "credentials", "password", "denied", "login")):
+                await self._alert_operator_auth_failed("IMAP Inbound", str(e))
             return []
 
     def _fetch_unseen(self, limit: int) -> list[InboundMessage]:

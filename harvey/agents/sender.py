@@ -11,6 +11,7 @@ Native flow:
 """
 
 import asyncio
+import json
 import logging
 import random
 import re
@@ -80,6 +81,7 @@ class Sender:
         self.brain = brain
         self.state = state
         self.config = config
+        self.env = env
         self.instantly = InstantlyClient(env.instantly_api_key)
         self.provider = get_mail_provider(config, env)
         # Optional per-recipient compliance check; None unless enabled.
@@ -670,6 +672,10 @@ class Sender:
             colleague = await self.state.colleague_who_replied(prospect.id)
             if colleague:
                 return "cancelled", f"{COLLEAGUE_REPLIED} ({colleague})"
+        if item.get("provider") == "whatsapp":
+            if prospect.status in ("opted_out", "lost", "closed"):
+                return "cancelled", f"prospect status '{prospect.status}'"
+            return None
         gate = pre_send_check(
             item["to_email"], item["subject"], self._outgoing_body(item),
             prospect=prospect, allow_risky=allow_risky, kind=item["kind"],
@@ -745,6 +751,21 @@ class Sender:
                 due + extra,
                 key=lambda i: (i.get("send_at") or "", i.get("created_at") or ""),
             )
+        if not due:
+            return
+
+        # Partner / excluded companies filter: cancel any outbox items targeting them
+        from harvey.config import is_partner_or_excluded
+        safe_due = []
+        for item in due:
+            p_to = item.get("to_email", "")
+            p_subj = item.get("subject", "")
+            if is_partner_or_excluded(company=p_subj, email=p_to, phone=p_to, config=self.config):
+                logger.info(f"Sender: Skipping partner outbox item {item.get('id')} to {p_to}")
+                await self.state.update_outbox_status(item["id"], status="cancelled")
+                continue
+            safe_due.append(item)
+        due = safe_due
         if not due:
             return
 
@@ -849,24 +870,107 @@ class Sender:
                 continue
 
             body = self._outgoing_body(item)
-            try:
-                result = await self.provider.send_email(
-                    item["to_email"], item["subject"], body,
-                    thread_ref=item.get("thread_ref", ""),
-                    in_reply_to=item.get("in_reply_to", ""),
-                )
-            except Exception as e:
-                # It may have gone out before the error: never retry it.
-                await self.state.update_outbox_item(
-                    item["id"], status="failed",
-                    error=f"{MAYBE_SENT_PREFIX}send error: {e}"[:300],
-                )
-                logger.warning(f"Sender: send to {item['to_email']} raised: {e}")
-                continue
+            if item.get("provider") == "whatsapp":
+                from harvey.integrations.whatsapp import WhatsAppEngine, normalize_id_phone
+                from harvey.integrations.mail_provider import SendResult
+                wa = WhatsAppEngine(self.state, self.config, getattr(self, "env", None))
+                target_phone = normalize_id_phone(item["to_email"])
+                # Never message a main contact again if they already referred us to a PIC
+                async with self.state._connect() as db:
+                    cur_ref = await db.execute(
+                        """SELECT id FROM prospects
+                           WHERE (id = ? OR phone = ?)
+                             AND (status = 'opted_out' OR coalesce(personalization_notes,'') LIKE '%[REFERRED_TO_PIC%')
+                           LIMIT 1""",
+                        (item.get("prospect_id") or "", target_phone),
+                    )
+                    if await cur_ref.fetchone():
+                        await db.execute("UPDATE outbox SET status = 'cancelled' WHERE id = ?", (item["id"],))
+                        await db.commit()
+                        logger.info(f"Sender: Skip & cancel WA ke {target_phone} karena kontak utama sudah kasih PIC / opted_out.")
+                        continue
+                ok = await wa._send_text_auto(target_phone, body)
+                if ok:
+                    result = SendResult(ok=True, message_id=f"wa_{item['id']}")
+                    # Auto-attach Compro & Catalog PDFs when Outbox message promises catalog/profile
+                    combined_low = f"{item.get('subject', '')} {body}".lower()
+                    if any(k in combined_low for k in ("lampirkan katalog", "sertakan ringkasan katalog", "company profile", "katalog produk", "minta katalog")):
+                        try:
+                            from harvey.paths import PROJECT_ROOT
+                            assets_dir = PROJECT_ROOT / "data" / "assets" / "give_first"
+                            for fname, dl_name, cap in (
+                                ("Company_Profile_AndisLab.pdf", "Company_Profile_PT_Andis_Sentral_Laboratorium_2026.pdf", "📄 Company Profile Resmi PT Andis Sentral Laboratorium"),
+                                ("Katalog_Lengkap_AndisLab_2026.pdf", "Katalog_Lengkap_AndisLab_2026.pdf", "📘 Katalog Produk Lengkap AndisLab 2026"),
+                            ):
+                                fpath = assets_dir / fname
+                                if fpath.exists() and getattr(wa, "openwa", None) and wa.openwa.is_configured():
+                                    await asyncio.sleep(1.5)
+                                    await wa.openwa.send_document(
+                                        phone=target_phone,
+                                        file_path=str(fpath),
+                                        filename=dl_name,
+                                        caption=cap,
+                                    )
+                        except Exception as pdf_err:
+                            logger.warning(f"Sender: Gagal melampirkan PDF katalog/compro ke {target_phone}: {pdf_err}")
+
+                    cid = item.get("conversation_id")
+                    if cid:
+                        convo = await self.state.get_conversation(cid)
+                        if convo:
+                            thread = [m.model_dump(mode="json") for m in convo.thread]
+                            thread.append({
+                                "direction": "outbound",
+                                "channel": "whatsapp",
+                                "content": body,
+                                "text": body,
+                                "sender": "harvey",
+                                "timestamp": datetime.now(timezone.utc).isoformat(),
+                            })
+                            await self.state.update_conversation(cid, thread_json=json.dumps(thread))
+                else:
+                    result = SendResult(ok=False, error="WhatsApp send failed")
+            else:
+                try:
+                    result = await self.provider.send_email(
+                        item["to_email"], item["subject"], body,
+                        thread_ref=item.get("thread_ref", ""),
+                        in_reply_to=item.get("in_reply_to", ""),
+                    )
+                except Exception as e:
+                    # It may have gone out before the error: never retry it.
+                    await self.state.update_outbox_item(
+                        item["id"], status="failed",
+                        error=f"{MAYBE_SENT_PREFIX}send error: {e}"[:300],
+                    )
+                    logger.warning(f"Sender: send to {item['to_email']} raised: {e}")
+                    continue
             if not result.ok:
-                await self.state.update_outbox_item(
-                    item["id"], status="failed", error=result.error[:300]
-                )
+                prev_err = str(item.get("error") or "")
+                if "[RETRY_1]" not in prev_err:
+                    retry_at = (datetime.now(timezone.utc) + timedelta(minutes=10)).replace(tzinfo=None).isoformat()
+                    await self.state.update_outbox_item(
+                        item["id"],
+                        status="approved",
+                        send_at=retry_at,
+                        error=f"[RETRY_1] {result.error}"[:300],
+                    )
+                    logger.warning(f"Sender: {item['to_email']} gagal sekali; dijadwalkan ulang 10 menit lagi.")
+                else:
+                    await self.state.update_outbox_item(
+                        item["id"], status="failed", error=result.error[:300]
+                    )
+                    try:
+                        from harvey.integrations.whatsapp import WhatsAppEngine
+                        wa_alert = WhatsAppEngine(self.state, self.config, getattr(self, "env", None))
+                        await wa_alert.send_system_alert(
+                            f"⚠️ *[OUTBOX GAGAL SETELAH RETRY]*\n"
+                            f"Tujuan: `{item['to_email']}`\n"
+                            f"Subjek: {item.get('subject', '-')}\n"
+                            f"Error: {str(result.error)[:160]}"
+                        )
+                    except Exception:
+                        pass
                 continue
 
             sent += 1

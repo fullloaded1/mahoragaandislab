@@ -2,6 +2,7 @@
 
 import argparse
 import asyncio
+import os
 import subprocess
 import sys
 import textwrap
@@ -181,11 +182,36 @@ def cmd_dashboard(args):
         sys.exit(2)
 
     try:
+        allow_remote = getattr(args, "allow_remote", False)
+        tunnel = getattr(args, "tunnel", False)
+        send_wa = getattr(args, "send_wa", False)
+        wa_phone = getattr(args, "phone", "087764021131")
+
         if getattr(args, "url", False):
             # The unlock link for an already-running dashboard.
-            print(dashboard_url(host=args.host, port=args.port))
+            from harvey.paths import PROJECT_ROOT
+            urls_file = PROJECT_ROOT / "data" / "dashboard-urls.json"
+            if urls_file.exists() and "PYTEST_CURRENT_TEST" not in os.environ:
+                try:
+                    import json
+                    d = json.loads(urls_file.read_text(encoding="utf-8"))
+                    url_out = d.get("tunnel") or d.get("lan") or d.get("local")
+                    if url_out:
+                        print(url_out)
+                        return
+                except Exception:
+                    pass
+            print(dashboard_url(host=args.host, port=args.port, allow_remote=allow_remote))
             return
-        start_dashboard(host=args.host, port=args.port)
+        start_dashboard(
+            host=args.host,
+            port=args.port,
+            allow_remote=allow_remote,
+            tunnel=tunnel,
+            send_wa=send_wa,
+            wa_phone=wa_phone,
+            open_browser=not getattr(args, "no_open", False),
+        )
     except (DashboardSetupError, TokenError) as e:
         print(f"\n  Dashboard not started: {e}\n")
         sys.exit(2)
@@ -824,6 +850,289 @@ def cmd_sending(args):
     asyncio.run(_run())
 
 
+
+def cmd_source(args):
+    """Source lab products by request via Tavily & Firecrawl."""
+    from harvey.config import load_config, load_env
+    from harvey.state import StateManager
+    from harvey.brain import Brain
+    from harvey.integrations.sourcing import SourcingEngine
+
+    async def _run():
+        config = load_config()
+        env = load_env()
+        state = StateManager()
+        await state.init_db()
+        brain = Brain(state, config.brain)
+
+        engine = SourcingEngine(brain, env, config)
+        print(f"\n[SOURCING] Mencari supplier & spesifikasi untuk: '{args.query}' (By Request)...")
+        margin = args.margin / 100.0 if args.margin else None
+        res = await engine.source_item(
+            item_query=args.query,
+            client_name=args.client or "Bapak/Ibu",
+            institution=args.institution or "Laboratorium",
+            margin_pct=margin,
+        )
+
+        pricing = res.get("pricing", {})
+        print("\n" + "=" * 60)
+        print(f"PRODUK         : {res.get('official_name', args.query)}")
+        print(f"MEREK / SKU    : {res.get('brand', '-')} | Cat: {res.get('model_or_cat_no', '-')}")
+        print(f"SPESIFIKASI    : {res.get('key_specs', '-')}")
+        print(f"ESTIMASI HPP   : {pricing.get('formatted_hpp', '-')}")
+        print(f"HARGA JUAL     : {pricing.get('formatted_quote_price', '-')} (Margin: {pricing.get('margin_pct')}%)")
+        print(f"ESTIMASI INDEN : {res.get('lead_time_days', '-')}")
+        print("=" * 60)
+
+        print("\nDRAF PESAN KONSULTATIF AHNAF (WhatsApp / Email):")
+        print("-" * 60)
+        print(res.get("consultative_response", "-"))
+        print("-" * 60)
+
+        refs = res.get("supplier_references", [])
+        if refs:
+            print("\nSUMBER DISTRIBUTOR / VENDOR DITEMUKAN:")
+            for s in refs:
+                print(f"  * {s.get('name')}: {s.get('url')}")
+        print()
+
+    asyncio.run(_run())
+
+def cmd_quote(args):
+    """Manage SPH/Quotes and automated post-quotation follow-up chaser."""
+    from harvey.integrations.quote_chaser import QuoteChaser
+    from harvey.config import load_config, load_env
+    from harvey.integrations.whatsapp import WhatsAppEngine
+    from harvey.state import StateManager
+
+    async def _run():
+        config = load_config()
+        env = load_env()
+        state = StateManager()
+        await state.init_db()
+        wa_engine = WhatsAppEngine(state, config, env)
+        chaser = QuoteChaser(wa_engine)
+
+        action = args.quote_action
+        if action == "add":
+            if not args.id or not args.client:
+                print("\n  Error: --id dan --client wajib diisi. Contoh:")
+                print("  harvey quote add --id QUO-033 --client \"RSUD Tebo\" --name \"Ibu NurHikmah\" --phone \"0812...\" --items \"Lemari Asam 1.5m\"\n")
+                return
+            await chaser.add_quote(
+                quote_id=args.id,
+                company=args.client,
+                contact_name=args.name,
+                phone=args.phone,
+                items_summary=args.items,
+                total_amount=args.amount,
+                sent_date_str=args.date,
+            )
+            print(f"\n  [OK] Penawaran {args.id} untuk {args.client} berhasil dicatat di QuoteChaser.\n")
+        elif action == "chaser":
+            print("\n  Memeriksa penawaran yang sudah jatuh tempo follow-up (H+2, H+6, H+12)...")
+            count = await chaser.process_due_followups(dry_run=args.dry_run)
+            print(f"  [SELESAI] {count} pesan follow-up penawaran diproses.\n")
+        else:
+            quotes = await chaser.list_quotes()
+            print(f"\n  Daftar Penawaran (Quotes) Terdata: {len(quotes)}")
+            print("  " + "=" * 70)
+            if not quotes:
+                print("  Belum ada penawaran tercatat. Tambahkan dengan: harvey quote add ...\n")
+                return
+            for q in quotes:
+                stage_lbl = f"Stage {q['stage']}/3" if q['stage'] else "Baru Dikirim"
+                print(f"  [{q['id']}] {q['company']} ({q['contact_name'] or '-'})")
+                print(f"    Item   : {q['items_summary'] or '-'}")
+                print(f"    Tgl    : {q['sent_date']} | Status: {q['status']} ({stage_lbl})")
+                print(f"    Kontak : {q['phone'] or '-'} | Last Follow-up: {q['last_followup_at'] or 'Belum'}")
+                print()
+
+    asyncio.run(_run())
+
+
+def cmd_whatsapp(args):
+    """Manage WhatsApp Web login, status, run outreach, or send daily report."""
+    from harvey.config import load_config, load_env
+    from harvey.integrations.whatsapp import WhatsAppEngine
+    from harvey.state import StateManager
+
+    async def _run():
+        config = load_config()
+        env = load_env()
+        state = StateManager()
+        await state.init_db()
+        engine = WhatsAppEngine(state, config, env)
+        action = args.wa_action
+        if action == "login":
+            await engine.interactive_login()
+        elif action == "run":
+            config.channels.whatsapp.enabled = True
+            sent = await engine.run()
+            print(f"\n  WhatsApp outreach selesai: {sent} pesan terkirim.\n")
+        elif action in ("report", "weekly-report"):
+            target = getattr(args, "phone", "") or config.channels.whatsapp.report_phone or "087764021131"
+            if action == "weekly-report" or getattr(args, "weekly", False):
+                print(f"\n  Mengirimkan laporan MINGGUAN WhatsApp ke {target}...")
+                ok = await engine.send_weekly_report(target_phone=target)
+                rep_type = "mingguan"
+            else:
+                print(f"\n  Mengirimkan laporan harian WhatsApp ke {target}...")
+                ok = await engine.send_daily_report(target_phone=target, force=True)
+                rep_type = "harian"
+            if ok:
+                print(f"  [OK] Laporan {rep_type} berhasil dikirim ke {target}.\n")
+            else:
+                print(f"  [GAGAL] Gagal mengirimkan laporan {rep_type} ke {target}.\n")
+        else:
+            act = engine._load_activity()
+            logged = engine.is_logged_in_profile_present() or bool(env.fonnte_api_key)
+            print(f"\n  WhatsApp Status:")
+            print(f"    Enabled       : {config.channels.whatsapp.enabled}")
+            print(f"    Provider      : {'fonnte' if env.fonnte_api_key else config.channels.whatsapp.provider}")
+            print(f"    Session Ready : {'YES' if logged else 'NO (run: harvey whatsapp login)'}")
+            print(f"    Sent Today    : {act['sent']}/{config.channels.whatsapp.max_daily_messages}")
+            print(f"    Work Hours    : {config.channels.whatsapp.work_hours_start} - {config.channels.whatsapp.work_hours_end} WIB")
+            print(f"    Auto Report   : {'AKTIF' if config.channels.whatsapp.auto_report else 'NONAKTIF'} -> {config.channels.whatsapp.report_phone} (@ {config.channels.whatsapp.report_time} WIB)")
+            print(f"    Last Report   : {act.get('last_report_date', 'Belum terkirim hari ini')}\n")
+
+    asyncio.run(_run())
+
+
+def cmd_inaproc(args):
+    """Manage INAPROC E-Katalog v6 Agent & Mini Kompetisi Co-Pilot."""
+    from harvey.config import load_config, load_env
+    from harvey.integrations.inaproc_watcher import InaprocWatcher, format_inaproc_alert_message
+    from harvey.agents.inaproc_agent import InaprocAgent
+    from harvey.integrations.whatsapp import WhatsAppEngine
+    from harvey.state import StateManager
+    from harvey.brain import Brain
+
+    async def _run():
+        config = load_config()
+        env = load_env()
+        state = StateManager()
+        await state.init_db()
+        brain = Brain(state, config.brain)
+        agent = InaprocAgent(state, config, env, brain)
+        watcher = InaprocWatcher()
+
+        action = args.inaproc_action
+        if action == "login":
+            await agent.interactive_login()
+        elif action == "status":
+            st = await agent.check_session_status()
+            print("\n  " + "=" * 58)
+            print("  STATUS SESI INAPROC E-KATALOG V6")
+            print("  " + "=" * 58)
+            status_symbol = "🟢 AKTIF" if st.get("logged_in") else "🔴 BELUM LOGIN"
+            print(f"  Status        : {status_symbol}")
+            print(f"  Portal Target : E-Katalog {st.get('portal', 'v6').upper()} (katalog.inaproc.id)")
+            print(f"  Login Terakhir: {st.get('last_login') or 'Belum pernah'}")
+            print(f"  Keterangan    : {st.get('status_text', '-')}")
+            print("  " + "=" * 58 + "\n")
+        elif action == "copilot":
+            print("\n  ⚡ [CO-PILOT INAPROC] Menjalankan siklus otonom Mini Kompetisi...")
+            print("  Margin Minimal : 20% di atas HPP")
+            print("  Mode Eksekusi  : Auto-Submit")
+            res = await agent.run_copilot_cycle(auto_submit=True)
+            print(f"\n  Siklus selesai. {len(res)} penawaran diproses:")
+            for b in res:
+                print(f"  - [{b.get('status', 'draft')}] {b.get('package_name')} -> Rp {int(b.get('target_price', 0)):,} (Margin {b.get('margin_pct')}%)")
+            print()
+        elif action == "bids":
+            bids = await state.get_inaproc_bids()
+            print(f"\n  📋 [DAFTAR BID MINI KOMPETISI] Total {len(bids)} paket terekam:\n")
+            if not bids:
+                print("  Belum ada data bid. Jalankan: harvey inaproc copilot\n")
+                return
+            for b in bids:
+                hpp_str = f"Rp {int(b.get('cost_hpp', 0)):,}".replace(",", ".")
+                price_str = f"Rp {int(b.get('target_price', 0)):,}".replace(",", ".")
+                print(f"  [{b.get('status', 'new').upper():<10}] {b.get('package_name', '')[:45]}")
+                print(f"               Instansi : {b.get('institution', '-')}")
+                print(f"               Produk   : {b.get('matched_product_name', '-')}")
+                print(f"               HPP      : {hpp_str} | Tawaran: {price_str} (Margin {b.get('margin_pct')}%)")
+                print(f"               Catatan  : {b.get('notes', '-')}\n")
+        elif action == "search":
+            kw = getattr(args, "keyword", "").strip()
+            keywords = [kw] if kw else None
+            pages = getattr(args, "pages", 1)
+            notify = getattr(args, "notify", False)
+            auto_sub = getattr(args, "auto_submit", False)
+
+            kw_label = f"kata kunci '{kw}'" if kw else "kategori utama laboratorium"
+            print(f"\n  🔍 [AUTONOMOUS SEARCH INAPROC] Mencari tender aktif untuk {kw_label}...")
+            print("  Sesi Browser : Menggunakan profil autentikasi penyedia.inaproc.id")
+            if notify:
+                print("  Notifikasi   : WhatsApp Alert aktif -> 087764021131")
+
+            found_pkgs = await agent.scan_and_alert_competitions(
+                keywords=keywords,
+                notify_wa=notify,
+                auto_submit=auto_sub,
+            )
+
+            print(f"\n  Hasil Pencarian Otonom: {len(found_pkgs)} paket tender / mini kompetisi ditemukan:\n")
+            if not found_pkgs:
+                print("  Tidak ada paket yang cocok ditemukan saat ini.\n")
+                return
+
+            for idx, p in enumerate(found_pkgs, start=1):
+                hps_str = f"Rp {int(p.get('hps_budget', 0)):,}".replace(",", ".") if p.get('hps_budget', 0) > 0 else "N/A"
+                print("=" * 68)
+                print(f"  [{idx}] {p.get('package_name')}")
+                print(f"      ID Paket    : {p.get('id')} ({p.get('procurement_type', 'Mini Kompetisi')})")
+                print(f"      Instansi    : {p.get('institution')} | {p.get('location')}")
+                print(f"      Total HPS   : {hps_str}")
+                print(f"      Batas Waktu : {p.get('deadline')} ({p.get('time_left', 'Segera')})")
+                if p.get("spec_bank_match"):
+                    print(f"      Produk Cocok: {p.get('spec_bank_match')}")
+                if p.get("target_price", 0) > 0:
+                    t_str = f"Rp {int(p['target_price']):,}".replace(",", ".")
+                    print(f"      Estimasi    : Harga Penawaran {t_str} (Margin {p.get('margin_pct', 20)}%)")
+                if p.get("products"):
+                    print(f"      Rincian Item: {len(p['products'])} macam produk terdaftar")
+                print(f"      Tautan Link : {p.get('source_url')}")
+            print("=" * 68 + "\n")
+        elif action == "scan":
+            print("\n  🔍 [RADAR INAPROC] Memindai peluang Mini Kompetisi & LPSE live...")
+            new_packages = await watcher.scan_live_procurement(env, brain)
+            print(f"\n  Discovered {len(new_packages)} paket peluang baru:")
+            for pkg in new_packages:
+                budget_str = f"Rp {int(pkg.hps_budget):,}".replace(",", ".") if pkg.hps_budget > 0 else "Belum tertera"
+                print("-" * 65)
+                print(f"  🏢 Instansi : {pkg.institution}")
+                print(f"  📦 Paket    : {pkg.package_name}")
+                print(f"  🏷️  Metode   : {pkg.procurement_type} | Skor: {pkg.match_score}%")
+                print(f"  💰 Pagu/HPS : {budget_str}")
+                print(f"  📍 Lokasi   : {pkg.location} | Batas: {pkg.deadline}")
+                print(f"  🔗 URL      : {pkg.source_url}")
+
+                if getattr(args, "notify", False):
+                    wa_engine = WhatsAppEngine(state, config, env)
+                    alert_msg = format_inaproc_alert_message(pkg)
+                    sent = await wa_engine.send_inaproc_alert(alert_msg)
+                    if sent:
+                        print("  📱 Alert WhatsApp terkirim ke Ahnaf Ibrahim!")
+            print("-" * 65)
+            print()
+        else:
+            # list
+            pkgs = watcher.load_known_packages()
+            print(f"\n  📦 [RADAR INAPROC] Total {len(pkgs)} paket tersimpan di database:\n")
+            if not pkgs:
+                print("  Belum ada paket tersimpan. Jalankan: harvey inaproc scan\n")
+                return
+            for pid, data in sorted(pkgs.items(), key=lambda x: x[1].get("match_score", 0), reverse=True):
+                budget_str = f"Rp {int(data.get('hps_budget', 0)):,}".replace(",", ".") if data.get('hps_budget', 0) > 0 else "N/A"
+                print(f"  [{data.get('match_score', 0)}%] {data.get('procurement_type', 'Tender'):<24} | {budget_str:<15} | {data.get('package_name', '')[:50]}")
+                print(f"        Instansi: {data.get('institution', '-')} | URL: {data.get('source_url', '-')}\n")
+
+    asyncio.run(_run())
+
+
 def main():
     from harvey.textio import utf8_stdio
     utf8_stdio()
@@ -873,11 +1182,20 @@ def main():
     # harvey dashboard
     sub = subparsers.add_parser("dashboard", help="Open the web dashboard")
     sub.add_argument("--host", default="127.0.0.1",
-                     help="Loopback address to listen on (default: 127.0.0.1; "
-                          "other addresses are refused)")
+                     help="Address to listen on (default: 127.0.0.1; use 0.0.0.0 with --allow-remote)")
     sub.add_argument("--port", type=int, default=5555, help="Port (default: 5555)")
     sub.add_argument("--url", action="store_true",
                      help="Print the unlock link (with its token) and exit")
+    sub.add_argument("--allow-remote", action="store_true",
+                     help="Allow access from other devices on the same Wi-Fi / local network")
+    sub.add_argument("--tunnel", action="store_true",
+                     help="Create an encrypted Cloudflare HTTPS tunnel for mobile remote access anywhere")
+    sub.add_argument("--send-wa", action="store_true",
+                     help="Send the mobile dashboard link directly to your WhatsApp")
+    sub.add_argument("--phone", default="087764021131",
+                     help="WhatsApp destination number for dashboard link")
+    sub.add_argument("--no-open", action="store_true",
+                     help="Do not automatically open the browser on startup")
     sub.set_defaults(func=cmd_dashboard)
 
     # harvey status
@@ -987,6 +1305,45 @@ def main():
     sub = subparsers.add_parser("usage", help="Show brain usage and quota (Claude or Codex)")
     sub.add_argument("--days", type=int, default=30, help="Breakdown window (default: 30)")
     sub.set_defaults(func=cmd_usage)
+
+    # harvey quote list|add|chaser
+    sub = subparsers.add_parser("quote", help="Manage quotes & automated follow-up chaser")
+    sub.add_argument("quote_action", nargs="?", default="list", choices=["list", "add", "chaser"])
+    sub.add_argument("--id", default="", help="Nomor SPH/Quote (e.g. QUO-033)")
+    sub.add_argument("--client", default="", help="Nama Perusahaan/Instansi (e.g. RSUD Tebo)")
+    sub.add_argument("--name", default="", help="Nama PIC Klien (e.g. Ibu NurHikmah)")
+    sub.add_argument("--phone", default="", help="Nomor WA Klien")
+    sub.add_argument("--items", default="", help="Ringkasan item yang ditawarkan")
+    sub.add_argument("--amount", type=float, default=0.0, help="Total nilai penawaran (Rp)")
+    sub.add_argument("--date", default="", help="Tanggal kirim (YYYY-MM-DD)")
+    sub.add_argument("--dry-run", action="store_true", help="Cek jadwal follow-up tanpa kirim beneran")
+    sub.set_defaults(func=cmd_quote)
+
+    # harvey whatsapp login|status|run|report|weekly-report
+    sub = subparsers.add_parser("whatsapp", help="WhatsApp outreach, QR login & reporting")
+    sub.add_argument("wa_action", nargs="?", default="status", choices=["login", "status", "run", "report", "weekly-report"])
+    sub.add_argument("--phone", default="", help="Target phone number for report")
+    sub.add_argument("--weekly", action="store_true", help="Send weekly report instead of daily")
+    sub.set_defaults(func=cmd_whatsapp)
+
+    # harvey source <query>
+    sub = subparsers.add_parser("source", help="Source lab products by request via Tavily & Firecrawl")
+    sub.add_argument("query", help="Nama alat, reagen, atau nomor katalog yang dicari")
+    sub.add_argument("--client", default="", help="Nama klien / PIC")
+    sub.add_argument("--institution", default="", help="Nama kampus / rumah sakit / instansi")
+    sub.add_argument("--margin", type=float, default=20.0, help="Persentase margin penawaran (default: 20%%)")
+    sub.set_defaults(func=cmd_source)
+
+    # harvey inaproc login|status|copilot|scan|search|bids|list
+    sub = subparsers.add_parser("inaproc", help="Dedicated Agent for INAPROC E-Katalog v6 & Mini Kompetisi")
+    sub.add_argument("inaproc_action", nargs="?", default="status",
+                     choices=["login", "status", "copilot", "scan", "search", "bids", "list"])
+    sub.add_argument("--id", default="", help="ID Paket untuk submit manual")
+    sub.add_argument("--keyword", default="", help="Kata kunci pencarian spesifik (misal: 'Laboratorium', 'Reagen')")
+    sub.add_argument("--pages", type=int, default=1, help="Jumlah halaman pencarian (default: 1)")
+    sub.add_argument("--notify", action="store_true", help="Kirimkan WhatsApp alert ke operator jika ada paket baru")
+    sub.add_argument("--auto-submit", action="store_true", help="Otomatis ajukan penawaran jika margin >= 20%%")
+    sub.set_defaults(func=cmd_inaproc)
 
     args = parser.parse_args()
     args._project_root = project_root

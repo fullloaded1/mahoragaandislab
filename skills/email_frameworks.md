@@ -299,3 +299,36 @@ Before finalizing any email, ask:
 8. Is the subject line honest, and the identity the real configured persona?
 
 If the answer to #5 or #6 is yes, or #7 or #8 is no, rewrite it. No exceptions.
+
+---
+
+## Indonesian B2B Lab Procurement Adaptation (Soft-Selling Rules)
+
+### Subject Lines (Indonesian Context)
+- Follow the 2-4 words rule: lowercase, conversational, internal-looking.
+- Good examples: `kebutuhan lab qc`, `spesifikasi autoclave`, `peremajaan oven lab`, `dokumen sph`, `persiapan akreditasi lab`.
+- Bad examples: `Penawaran Terbaik Alat Lab Diskon 20%`, `Solusi Lab Modern Hemat Biaya`, `Penting: Serapan Anggaran Lab`.
+
+### Personalization by Institution Type
+Connect observations directly to the institution's operational context:
+- **Kampus / Universitas**: Reference lab accreditation preparation, student practicum capacity, or research grant implementation (hibah riset).
+- **Rumah Sakit / Medis**: Focus on sterilization workflow reliability (CSSD), diagnostic turnaround, or KARS accreditation standards.
+- **Pabrik / Industri QC**: Focus on batch testing turnaround, ISO 17025 compliance, or minimizing QC testing bottlenecks.
+- **Instansi Pemerintah / Riset**: Focus on procurement documentation readiness (SPH resmi, e-Katalog INAPROC compliance, spesifikasi teknis).
+
+### Give-First & Resource Offers (Never Ask for a Meeting First)
+In email 1, offer a helpful asset before asking for anything in return:
+- Offer an equipment specification comparison matrix (e.g. comparing local vs imported analytical balance specs).
+- Offer a site-preparation checklist (electrical power, ventilation, and water requirements for autoclaves).
+- Offer an HPS (Harga Perkiraan Sendiri) benchmark reference for upcoming budget drafting.
+- Example CTA: *"Would a 1-page spec comparison between standard and ISO-grade autoclaves be helpful for your team?"* (Under 75 words total, no links in email 1).
+
+### Follow-Up Cadence & Reply Handling
+- **Cadence**: 3 touches spread across 14-21 days (Day 1: Resource offer / observation -> Day 5-7: Alternative operational angle -> Day 14-18: Clean breakup closing the loop).
+- **Bump Follow-up**: Keep it under 50 words. Never say "just checking in" or re-pitch at length.
+- **Reply Handling**:
+  - *Positive*: Reply within minutes during business hours. Propose 2 specific meeting windows (e.g. "Selasa jam 10.00 WIB atau Kamis jam 14.00 WIB").
+  - *Spec / Price Request*: Answer the core question directly and provide standard specs; do not gate basic details behind a phone call.
+  - *Not Now ("Belum butuh")*: Acknowledge warmly, offer to reconnect before the next budgeting cycle, and pause outreach.
+  - *Opt-Out / Hostile*: Suppress immediately and permanently across all channels. Never argue or send a parting pitch.
+

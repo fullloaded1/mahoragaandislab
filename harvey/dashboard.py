@@ -7,12 +7,16 @@ import logging
 import os
 import signal
 import stat
+import re
+import socket
 import subprocess
+import time
 import sys
 import tempfile
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from urllib.parse import quote
 
 import aiosqlite
 import yaml
@@ -33,6 +37,7 @@ CONFIG_FILE = PROJECT_ROOT / "harvey.yaml"
 PID_FILE = PROJECT_ROOT / "data" / "harvey.pid"
 LOG_FILE = PROJECT_ROOT / "data" / "harvey.log"
 TOKEN_FILE = PROJECT_ROOT / "data" / "dashboard-token"
+URLS_FILE = PROJECT_ROOT / "data" / "dashboard-urls.json"
 
 
 def _resolve_config_file() -> Path:
@@ -52,10 +57,43 @@ app = FastAPI(title="Harvey Dashboard", docs_url=None, redoc_url=None, openapi_u
 token_store = auth.TokenStore(TOKEN_FILE)
 app.add_middleware(auth.DashboardGuard, store=token_store)
 
+
+@app.middleware("http")
+async def add_no_cache_headers(request: Request, call_next):
+    response = await call_next(request)
+    if request.url.path.startswith("/api/"):
+        response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate, max-age=0"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
+    return response
+
 # Harvey process tracking
 _harvey_process: subprocess.Popen | None = None
 _harvey_started_at: datetime | None = None
 _env_lock = asyncio.Lock()
+
+
+@app.on_event("startup")
+async def start_realtime_sync_daemon():
+    """Background task to continuously sync WhatsApp chats and INAPROC radar in real-time."""
+    async def _sync_loop():
+        await asyncio.sleep(2)
+        while True:
+            try:
+                from harvey.config import load_config, load_env
+                from harvey.integrations.whatsapp import WhatsAppEngine
+                from harvey.state import StateManager
+                state = StateManager()
+                await state.init_db()
+                cfg = load_config()
+                env = load_env()
+                wa = WhatsAppEngine(state, cfg, env)
+                await wa.sync_live_chats_from_openwa(limit=50)
+            except Exception as e:
+                logger.debug(f"Dashboard realtime sync notice: {e}")
+            await asyncio.sleep(5)
+
+    asyncio.create_task(_sync_loop())
 
 
 # ── Helpers ──
@@ -70,7 +108,8 @@ async def query_db(sql: str, params: tuple = ()) -> list[dict]:
     if not DB_PATH.exists():
         return []
     try:
-        async with aiosqlite.connect(str(DB_PATH)) as db:
+        async with aiosqlite.connect(str(DB_PATH), timeout=30.0) as db:
+            await db.execute("PRAGMA busy_timeout=30000")
             db.row_factory = aiosqlite.Row
             async with db.execute(sql, params) as cursor:
                 rows = await cursor.fetchall()
@@ -156,6 +195,25 @@ def _write_env_file(updates: dict[str, str]):
     load_dotenv(str(ENV_FILE), override=True)
 
 
+def _is_pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if handle:
+            kernel32.CloseHandle(handle)
+            return True
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except (ProcessLookupError, PermissionError, OSError):
+        return False
+
+
 def _check_harvey_pid() -> int | None:
     """Check if there's a running Harvey process from a PID file."""
     global _harvey_process, _harvey_started_at
@@ -164,9 +222,10 @@ def _check_harvey_pid() -> int | None:
     if PID_FILE.exists():
         try:
             pid = int(PID_FILE.read_text(encoding="utf-8").strip())
-            os.kill(pid, 0)  # Check if process exists
-            return pid
-        except (ValueError, ProcessLookupError, PermissionError):
+            if _is_pid_alive(pid):
+                return pid
+            PID_FILE.unlink(missing_ok=True)
+        except Exception:
             PID_FILE.unlink(missing_ok=True)
     return None
 
@@ -472,7 +531,7 @@ async def add_feedback(request: Request):
     feedback_id = uuid.uuid4().hex[:12]
     try:
         DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-        async with aiosqlite.connect(str(DB_PATH)) as db:
+        async with aiosqlite.connect(str(DB_PATH), timeout=30.0) as db:
             # Ensure the table exists so feedback works even on a fresh install
             await db.execute(
                 """CREATE TABLE IF NOT EXISTS feedback (
@@ -799,8 +858,20 @@ async def get_usage():
 
 
 @app.get("/api/prospects")
-async def get_prospects():
-    rows = await query_db("SELECT * FROM prospects ORDER BY created_at DESC LIMIT 200")
+async def get_prospects(range: str = "all"):
+    rng = (range or "all").lower()
+    where_clause = ""
+    limit_n = 250
+    if rng == "today":
+        where_clause = "WHERE date(coalesce(updated_at, created_at), '+7 hours') = date('now', '+7 hours')"
+    elif rng == "yesterday":
+        where_clause = "WHERE date(coalesce(updated_at, created_at), '+7 hours') = date('now', '+7 hours', '-1 day')"
+    elif rng == "week":
+        where_clause = "WHERE date(coalesce(updated_at, created_at), '+7 hours') >= date('now', '+7 hours', '-7 days')"
+
+    rows = await query_db(
+        f"SELECT * FROM prospects {where_clause} ORDER BY coalesce(updated_at, created_at) DESC LIMIT {limit_n}"
+    )
     # Someone whose opt-out was undone keeps a way to see what happened.
     undone = {r["pid"] for r in await query_db(
         "SELECT DISTINCT json_extract(details_json, '$.prospect_id') AS pid FROM actions "
@@ -834,13 +905,29 @@ async def _with_context(items: list[dict]) -> list[dict]:
 
     people = {r["id"]: r for r in (await query_db(
         "SELECT p.id, p.first_name, p.last_name, p.title, p.source, p.email_status, "
-        "p.score, p.personalization_notes, p.company_id, c.name AS company_name, "
-        "c.domain, c.website, c.description, c.industry AS found_by "
+        "p.score, p.personalization_notes, p.company_id, COALESCE(NULLIF(c.name, ''), p.company) AS company_name, "
+        "c.domain, c.website, c.description, COALESCE(NULLIF(c.industry, ''), p.industry) AS found_by "
         "FROM prospects p LEFT JOIN companies c ON c.id = p.company_id "
         f"WHERE p.id IN ({_in(pids)})", tuple(pids)) if pids else [])}
     campaigns = {r["id"]: r["name"] for r in (await query_db(
         f"SELECT id, name FROM campaigns WHERE id IN ({_in(cids)})",
         tuple(cids)) if cids else [])}
+
+    conv_ids = sorted({i["conversation_id"] for i in items if i.get("conversation_id")})
+    convs_by_id: dict[str, dict] = {}
+    convs_by_pid: dict[str, dict] = {}
+    if conv_ids:
+        for cr in await query_db(
+            f"SELECT id, prospect_id, stage, intent, thread_json FROM conversations WHERE id IN ({_in(conv_ids)})",
+            tuple(conv_ids),
+        ):
+            convs_by_id[cr["id"]] = cr
+    if pids:
+        for cr in await query_db(
+            f"SELECT id, prospect_id, stage, intent, thread_json FROM conversations WHERE prospect_id IN ({_in(pids)}) ORDER BY updated_at DESC",
+            tuple(pids),
+        ):
+            convs_by_pid.setdefault(cr["prospect_id"], cr)
 
     company_ids = sorted({p["company_id"] for p in people.values() if p.get("company_id")})
     signals: dict[str, dict[str, str]] = {}
@@ -879,6 +966,29 @@ async def _with_context(items: list[dict]) -> list[dict]:
 
     for item in items:
         p = people.get(item.get("prospect_id")) or {}
+        conv = convs_by_id.get(item.get("conversation_id") or "") or convs_by_pid.get(item.get("prospect_id") or "") or {}
+        recent_chat: list[dict] = []
+        if conv.get("thread_json"):
+            try:
+                raw_th = json.loads(conv["thread_json"] or "[]")
+                prev_txt = ""
+                for m in raw_th[-8:]:
+                    txt = str(m.get("content") or m.get("text") or "").strip()
+                    if txt and txt != prev_txt:
+                        recent_chat.append({
+                            "direction": m.get("direction") or "inbound",
+                            "sender": "Ahnaf (AndisLab)" if m.get("direction") == "outbound" else (p.get("first_name") or "Klien"),
+                            "text": txt[:280],
+                        })
+                        prev_txt = txt
+                recent_chat = recent_chat[-4:]
+            except Exception:
+                recent_chat = []
+
+        # Strip repetitive [WA_REPLIED:...] tags from notes so UI stays clean
+        raw_notes = str(p.get("personalization_notes") or "")
+        clean_notes = re.sub(r"(\s*\|\s*)?\[WA_REPLIED:[^\]]+\]", "", raw_notes).strip(" |")
+
         item["context"] = {
             "campaign": campaigns.get(item.get("campaign_id"), ""),
             "company": p.get("company_name", ""),
@@ -890,7 +1000,9 @@ async def _with_context(items: list[dict]) -> list[dict]:
             "contact_source": p.get("source", ""),
             "email_status": p.get("email_status", ""),
             "score": p.get("score"),
-            "notes": p.get("personalization_notes", ""),
+            "notes": clean_notes,
+            "deal_stage": conv.get("stage") or "",
+            "recent_chat": recent_chat,
             "signals": signals.get(p.get("company_id"), {}),
         }
     return items
@@ -994,6 +1106,75 @@ async def outbox_approve(item_id: str):
     try:
         state = _state()
         await state.init_db()
+        item = await state.get_outbox_item(item_id)
+        if not item or item.get("status") not in ("pending_review",):
+            return {"success": False, "message": "Pesan ini sudah pernah diproses/terkirim."}
+
+        # Lock immediately to prevent duplicate sends on fast double-clicks
+        await state.update_outbox_item(item_id, status="sending", approved_by="you")
+
+        if item.get("provider") == "whatsapp":
+            from harvey.config import load_config, load_env
+            from harvey.integrations.whatsapp import WhatsAppEngine, normalize_id_phone
+            cfg = load_config()
+            env = load_env()
+            wa = WhatsAppEngine(state, cfg, env)
+            body = item.get("body", "")
+            to_phone = normalize_id_phone(item.get("to_email", ""))
+            ok = await wa._send_text_auto(to_phone, body)
+            if ok:
+                now_iso = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
+                await state.update_outbox_item(item_id, status="sent", sent_at=now_iso, approved_by="you")
+                # Auto-attach Compro & Catalog PDFs when Outbox message promises catalog/profile
+                combined_low = f"{item.get('subject', '')} {body}".lower()
+                if any(k in combined_low for k in ("lampirkan katalog", "sertakan ringkasan katalog", "company profile", "katalog produk", "minta katalog")):
+                    try:
+                        assets_dir = PROJECT_ROOT / "data" / "assets" / "give_first"
+                        for fname, dl_name, cap in (
+                            ("Company_Profile_AndisLab.pdf", "Company_Profile_PT_Andis_Sentral_Laboratorium_2026.pdf", "📄 Company Profile Resmi PT Andis Sentral Laboratorium"),
+                            ("Katalog_Lengkap_AndisLab_2026.pdf", "Katalog_Lengkap_AndisLab_2026.pdf", "📘 Katalog Produk Lengkap AndisLab 2026"),
+                        ):
+                            fpath = assets_dir / fname
+                            if fpath.exists() and getattr(wa, "openwa", None) and wa.openwa.is_configured():
+                                await asyncio.sleep(1.5)
+                                await wa.openwa.send_document(
+                                    phone=to_phone,
+                                    file_path=str(fpath),
+                                    filename=dl_name,
+                                    caption=cap,
+                                )
+                    except Exception as pdf_err:
+                        logger.warning(f"Dashboard approve PDF attach warning for {to_phone}: {pdf_err}")
+                cid = item.get("conversation_id")
+                if cid:
+                    convo = await state.get_conversation(cid)
+                    if convo:
+                        thread = [m.model_dump(mode="json") for m in convo.thread]
+                        thread.append({
+                            "direction": "outbound",
+                            "channel": "whatsapp",
+                            "content": body,
+                            "text": body,
+                            "sender": "operator",
+                            "timestamp": datetime.now(timezone.utc).isoformat(),
+                        })
+                        await state.update_conversation(cid, thread_json=json.dumps(thread))
+                await state.log_action("whatsapp_reply_sent", "dashboard", {"outbox_id": item_id, "phone": to_phone})
+                try:
+                    await state.log_operator_feedback(
+                        outbox_id=item_id,
+                        prospect_id=item.get("prospect_id") or "",
+                        ai_draft=body,
+                        operator_action="OK",
+                        final_text=body,
+                    )
+                except Exception:
+                    pass
+                return {"success": True, "sent_immediate": True}
+            else:
+                # Revert if send failed
+                await state.update_outbox_item(item_id, status="pending_review")
+                return {"success": False, "message": "Gagal mengirim via WhatsApp."}
         n = await state.approve_outbox(item_id)
         return {"success": bool(n)}
     except Exception as e:
@@ -1051,6 +1232,23 @@ async def outbox_edit(item_id: str, request: Request):
             "outbox_id": item_id, "to_email": item.get("to_email", ""),
             "old_subject": item.get("subject", ""), "old_body": item.get("body", ""),
         })
+        try:
+            await state.log_operator_feedback(
+                outbox_id=item_id,
+                prospect_id=item.get("prospect_id") or "",
+                ai_draft=item.get("body") or "",
+                operator_action="REVISI",
+                final_text=text,
+            )
+            async def _refresh_chat_mem():
+                try:
+                    from harvey.integrations.big_data import MahoragaBigData
+                    MahoragaBigData().index_chat_memory()
+                except Exception:
+                    pass
+            asyncio.create_task(_refresh_chat_mem())
+        except Exception:
+            pass
         return {"success": True}
     except Exception as e:
         return JSONResponse({"success": False, "message": str(e)}, status_code=500)
@@ -1245,6 +1443,17 @@ async def outbox_reject(item_id: str):
         await state.init_db()
         if not await state.reject_outbox_item(item_id):
             return _refuse("That email is already sending or sent, so it can't be rejected.")
+        try:
+            item = await state.get_outbox_item(item_id)
+            await state.log_operator_feedback(
+                outbox_id=item_id,
+                prospect_id=(item or {}).get("prospect_id") or "",
+                ai_draft=(item or {}).get("body") or "",
+                operator_action="BATAL",
+                final_text="",
+            )
+        except Exception:
+            pass
         return {"success": True}
     except Exception as e:
         return JSONResponse({"success": False, "message": str(e)}, status_code=500)
@@ -1290,6 +1499,62 @@ async def export_prospects(all: bool = False, min_score: int = 0, email_status: 
     )
 
 
+@app.get("/api/export/prospects-wa.csv")
+async def export_prospects_wa():
+    """Export contacts that have WhatsApp/phone numbers to CSV with direct chat links."""
+    import csv
+    import io
+    import re
+
+    def clean_wa(raw):
+        if not raw:
+            return ""
+        digits = re.sub(r"[^\d]", "", str(raw))
+        if digits.startswith("08"):
+            digits = "628" + digits[2:]
+        elif digits.startswith("8") and len(digits) >= 9:
+            digits = "62" + digits
+        return digits
+
+    buf = io.StringIO()
+    try:
+        rows = await query_db(
+            "SELECT * FROM prospects WHERE phone IS NOT NULL AND TRIM(phone) != '' "
+            "ORDER BY score DESC, created_at DESC"
+        )
+        fieldnames = [
+            "first_name", "last_name", "company", "title", "phone",
+            "wa_number", "wa_link", "wa_outreach_status", "email", "score", "status", "created_at"
+        ]
+        writer = csv.DictWriter(buf, fieldnames=fieldnames)
+        writer.writeheader()
+        for r in rows:
+            wa_num = clean_wa(r.get("phone", ""))
+            notes = r.get("personalization_notes") or ""
+            is_wa_sent = "[WA_SENT" in notes
+            writer.writerow({
+                "first_name": r.get("first_name", ""),
+                "last_name": r.get("last_name", ""),
+                "company": r.get("company", ""),
+                "title": r.get("title", ""),
+                "phone": r.get("phone", ""),
+                "wa_number": wa_num,
+                "wa_link": f"https://wa.me/{wa_num}" if wa_num else "",
+                "wa_outreach_status": "Sudah Dikirim" if is_wa_sent else "Siap Dikirim",
+                "email": r.get("email", ""),
+                "score": r.get("score", 0),
+                "status": r.get("status", ""),
+                "created_at": r.get("created_at", ""),
+            })
+    except Exception as e:
+        logger.warning("WhatsApp prospects export failed: %s", e)
+    return PlainTextResponse(
+        buf.getvalue(),
+        media_type="text/csv",
+        headers={"Content-Disposition": 'attachment; filename="prospects-whatsapp.csv"'},
+    )
+
+
 @app.get("/api/campaigns")
 async def get_campaigns():
     rows = await query_db("SELECT * FROM campaigns ORDER BY created_at DESC LIMIT 100")
@@ -1298,6 +1563,8 @@ async def get_campaigns():
     footer = _compliance_view()["footer"]
     committed = await _harvey_committed_ids()
     hand_sent = await _hand_sent_ids()
+
+    all_ids: set[str] = set()
     for row in rows:
         try:
             row["sequence"] = json.loads(row.get("sequence_json", "[]"))
@@ -1307,14 +1574,25 @@ async def get_campaigns():
             row["prospect_ids"] = json.loads(row.get("prospect_ids_json", "[]"))
         except (json.JSONDecodeError, TypeError):
             row["prospect_ids"] = []
-        # Who each draft goes to, so the UI can open it in the user's own mail client.
+        all_ids.update(row["prospect_ids"])
+
+    prospects_by_id: dict[str, dict] = {}
+    if all_ids:
+        id_list = list(all_ids)
+        for start in range(0, len(id_list), 400):
+            chunk = id_list[start:start + 400]
+            p_rows = await query_db(
+                f"SELECT id, email, first_name, last_name, company, title, status, email_status, "
+                f"source, personalization_notes FROM prospects "
+                f"WHERE id IN ({','.join('?' * len(chunk))}) AND email != ''",
+                tuple(chunk),
+            )
+            for pr in p_rows:
+                prospects_by_id[pr["id"]] = pr
+
+    for row in rows:
         ids = row["prospect_ids"]
-        row["recipients"] = await query_db(
-            f"SELECT id, email, first_name, last_name, company, title, status, email_status, "
-            f"source, personalization_notes FROM prospects "
-            f"WHERE id IN ({','.join('?' * len(ids))}) AND email != ''",
-            tuple(ids),
-        ) if ids else []
+        row["recipients"] = [dict(prospects_by_id[pid]) for pid in ids if pid in prospects_by_id]
         row["send_as"] = send_as
         # A cold email sent by hand needs the same footer Harvey adds.
         row["footer"] = footer
@@ -1395,13 +1673,39 @@ async def undo_opt_out(prospect_id: str, request: Request):
 
 
 @app.get("/api/conversations")
-async def get_conversations():
-    rows = await query_db("""
+async def get_conversations(range: str = "all"):
+    # Trigger OpenWA sync in the background (non-blocking) so UI stays instant (<50ms)
+    async def _bg_sync():
+        try:
+            from harvey.config import load_config, load_env
+            from harvey.integrations.whatsapp import WhatsAppEngine
+            from harvey.state import StateManager
+            st = StateManager()
+            cfg = load_config()
+            env = load_env()
+            wa = WhatsAppEngine(st, cfg, env)
+            await asyncio.wait_for(wa.sync_live_chats_from_openwa(limit=50), timeout=8.0)
+        except Exception as sync_err:
+            logger.debug(f"Dashboard conversations bg-sync skipped: {sync_err}")
+
+    asyncio.create_task(_bg_sync())
+
+    rng = (range or "all").lower()
+    where_clause = ""
+    if rng == "today":
+        where_clause = "WHERE date(coalesce(c.updated_at, c.created_at), '+7 hours') = date('now', '+7 hours')"
+    elif rng == "yesterday":
+        where_clause = "WHERE date(coalesce(c.updated_at, c.created_at), '+7 hours') = date('now', '+7 hours', '-1 day')"
+    elif rng == "week":
+        where_clause = "WHERE date(coalesce(c.updated_at, c.created_at), '+7 hours') >= date('now', '+7 hours', '-7 days')"
+
+    rows = await query_db(f"""
         SELECT c.*, p.first_name, p.last_name, p.email as prospect_email, p.company,
-               p.status as prospect_status
+               p.status as prospect_status, p.phone as prospect_phone
         FROM conversations c
         LEFT JOIN prospects p ON c.prospect_id = p.id
-        ORDER BY c.updated_at DESC LIMIT 100
+        {where_clause}
+        ORDER BY coalesce(c.updated_at, c.created_at) DESC LIMIT 100
     """)
     # The stored thread holds replies and Harvey's answers; the cold emails
     # a reply answers live in the Outbox. Attach those (sent ones only) and
@@ -1416,7 +1720,7 @@ async def get_conversations():
             emails.setdefault(e.pop("prospect_id"), []).append(e)
     cids = [r["id"] for r in rows]
     drafts = {d.pop("conversation_id"): d for d in (await query_db(
-        "SELECT id, conversation_id, subject, body, send_at FROM outbox "
+        "SELECT id, conversation_id, subject, body, send_at, provider FROM outbox "
         f"WHERE kind = 'reply' AND status = 'pending_review' AND conversation_id IN ({_in(cids)}) "
         "ORDER BY created_at", tuple(cids)) if cids else [])}
     for row in rows:
@@ -1458,6 +1762,190 @@ async def set_conversation_status(convo_id: str, request: Request):
     return {"success": True, "status": status}
 
 
+@app.post("/api/conversations/{convo_id}/reply")
+async def send_conversation_reply(convo_id: str, request: Request):
+    """Operator sends a direct reply (via WhatsApp or email) to a conversation."""
+    try:
+        data = await request.json()
+    except Exception:
+        data = {}
+    message = (data.get("message") or "").strip()
+    outbox_id = data.get("outbox_id")
+    if not message:
+        return JSONResponse({"success": False, "message": "Pesan tidak boleh kosong."}, status_code=400)
+
+    state = _state()
+    await state.init_db()
+    rows = await query_db("""
+        SELECT c.*, p.phone, p.email, p.first_name, p.company
+        FROM conversations c
+        LEFT JOIN prospects p ON c.prospect_id = p.id
+        WHERE c.id = ?
+    """, (convo_id,))
+    if not rows:
+        return JSONResponse({"success": False, "message": "Percakapan tidak ditemukan."}, status_code=404)
+
+    convo = rows[0]
+    channel = convo.get("channel", "email")
+    phone = convo.get("phone", "")
+    email_addr = convo.get("email", "")
+
+    if channel == "whatsapp":
+        from harvey.config import load_config, load_env
+        from harvey.integrations.whatsapp import WhatsAppEngine, normalize_id_phone
+        cfg = load_config()
+        env = load_env()
+        wa = WhatsAppEngine(state, cfg, env)
+        target_phone = normalize_id_phone(phone)
+        if not target_phone:
+            return JSONResponse({"success": False, "message": "Nomor WhatsApp tidak valid untuk prospek ini."}, status_code=400)
+        sent = await wa._send_text_auto(target_phone, message)
+        if not sent:
+            return JSONResponse({"success": False, "message": "Gagal mengirim pesan WhatsApp."}, status_code=500)
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    now_naive = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
+    try:
+        thread = json.loads(convo.get("thread_json", "[]") or "[]")
+    except Exception:
+        thread = []
+    thread.append({
+        "direction": "outbound",
+        "channel": channel,
+        "content": message,
+        "text": message,
+        "sender": "operator",
+        "timestamp": now_iso,
+    })
+    await state.update_conversation(convo_id, thread_json=json.dumps(thread), status="open")
+    if outbox_id:
+        await state.update_outbox_item(outbox_id, status="sent", sent_at=now_naive, body=message, approved_by="operator")
+    await state.log_action("reply_sent_by_operator", "dashboard", {
+        "conversation_id": convo_id, "channel": channel, "recipient": phone if channel == "whatsapp" else email_addr
+    })
+    return {"success": True}
+
+
+# ── Adaptive Multi-Bubble Debounce Buffer for Incoming WhatsApp Webhooks ──
+_WA_BUBBLE_BUFFER: dict[str, dict] = {}
+_WA_SEEN_WEBHOOK_MSG_IDS: dict[str, float] = {}
+
+
+def _compute_adaptive_wa_wait_seconds(combined_text: str) -> float:
+    """
+    2-Layer Adaptive Wait Window:
+      - Short greeting / hanging opener (<= 3 words without clear intent): wait 25s
+        so customers typing slow multi-bubble messages finish their thought.
+      - Complete sentence / clear answer or question: wait 10s to catch any immediate follow-up bubble.
+    """
+    clean = (combined_text or "").strip().lower()
+    words = re.findall(r"[a-z0-9]+", clean)
+    clear_intent_cues = (
+        "?", "harga", "berapa", "ready", "stok", "sph", "penawaran", "katalog", "compro",
+        "brosur", "silahkan", "silakan", "boleh", "kamis", "jumat", "senin", "selasa",
+        "rabu", "jam ", "pukul", "bisa", "oven", "autoclave", "mikroskop", "timbangan",
+        "centrifuge", "incubator", "ph meter", "spektro", "reagen", "tidak", "belum",
+    )
+    if len(words) <= 3 and not any(c in clean for c in clear_intent_cues):
+        return 25.0
+    return 10.0
+
+
+@app.post("/api/whatsapp/webhook")
+async def whatsapp_webhook(request: Request):
+    """Receive incoming WhatsApp webhooks (OpenWA/Fonnte) with non-blocking Adaptive Multi-Bubble Coalescing."""
+    try:
+        data = await request.json()
+    except Exception:
+        data = {}
+
+    phone = ""
+    message = ""
+    title = ""
+    chat_id = ""
+    msg_id = ""
+
+    if "data" in data and isinstance(data["data"], dict):
+        d = data["data"]
+        if d.get("fromMe"):
+            return {"status": "ignored_echo"}
+        msg_id = str(d.get("id") or d.get("messageId") or "")
+        raw_from = d.get("from", "") or d.get("sender", "") or d.get("author", "")
+        chat_id = raw_from
+        phone = raw_from.split("@")[0] if "@" in raw_from else raw_from
+        message = d.get("body", "") or d.get("content", "") or d.get("text", "")
+        title = d.get("notifyName", "") or (d.get("sender", {}).get("name", "") if isinstance(d.get("sender"), dict) else d.get("notifyName", ""))
+    elif "sender" in data:
+        phone = str(data.get("sender", ""))
+        message = str(data.get("message", ""))
+        title = str(data.get("name", ""))
+        msg_id = str(data.get("id") or "")
+    elif "phone" in data:
+        phone = str(data.get("phone", ""))
+        message = str(data.get("message", "") or data.get("text", ""))
+        title = str(data.get("name", ""))
+        msg_id = str(data.get("id") or "")
+
+    phone = phone.strip()
+    message = message.strip()
+    if not phone or not message:
+        return {"status": "ignored_empty"}
+
+    # Deduplicate OpenWA webhook retries within 120s
+    now_m = time.monotonic()
+    for k_old, ts_old in list(_WA_SEEN_WEBHOOK_MSG_IDS.items()):
+        if now_m - ts_old > 120.0:
+            _WA_SEEN_WEBHOOK_MSG_IDS.pop(k_old, None)
+    dedup_key = msg_id or f"{phone}|{message}"
+    if dedup_key in _WA_SEEN_WEBHOOK_MSG_IDS:
+        return {"status": "ignored_duplicate_webhook"}
+    _WA_SEEN_WEBHOOK_MSG_IDS[dedup_key] = now_m
+
+    buf = _WA_BUBBLE_BUFFER.get(phone)
+    if buf is None:
+        buf = {"messages": [], "title": title, "chat_id": chat_id, "task": None}
+        _WA_BUBBLE_BUFFER[phone] = buf
+    if not buf["messages"] or buf["messages"][-1] != message:
+        buf["messages"].append(message)
+    if title:
+        buf["title"] = title
+    if chat_id:
+        buf["chat_id"] = chat_id
+
+    if buf.get("task") and not buf["task"].done():
+        buf["task"].cancel()
+
+    combined_preview = "\n".join(buf["messages"])
+    wait_s = _compute_adaptive_wa_wait_seconds(combined_preview)
+
+    async def _flush_after_debounce(target_phone: str, delay: float):
+        try:
+            await asyncio.sleep(delay)
+            entry = _WA_BUBBLE_BUFFER.pop(target_phone, None)
+            if not entry or not entry.get("messages"):
+                return
+            joined_msg = "\n".join(entry["messages"])
+            st = _state()
+            from harvey.config import load_config, load_env
+            from harvey.integrations.whatsapp import WhatsAppEngine
+            cfg = load_config()
+            env = load_env()
+            wa = WhatsAppEngine(st, cfg, env)
+            await wa.handle_single_inbound(
+                phone=target_phone,
+                message=joined_msg,
+                title=entry.get("title") or "",
+                chat_id=entry.get("chat_id") or "",
+            )
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            logger.warning(f"WhatsApp webhook flush error for {target_phone}: {exc}")
+
+    buf["task"] = asyncio.create_task(_flush_after_debounce(phone, wait_s))
+    return {"status": "buffered", "wait_seconds": wait_s, "bubbles": len(buf["messages"])}
+
+
 @app.get("/api/trend")
 async def get_trend(days: int = 14, tz: int = 0):
     """Daily counts for the last `days` days in the viewer's time zone
@@ -1482,12 +1970,352 @@ async def get_trend(days: int = 14, tz: int = 0):
         "found": await per_day("prospects", "created_at"),
         "sent": await per_day("outbox", "sent_at", "AND status = 'sent'"),
         "replies": await per_day("conversations", "created_at"),
+        "wa_sent": await per_day("actions", "created_at", "AND action_type = 'whatsapp_sent'"),
     }
 
 
+@app.get("/api/quotes")
+async def get_quotes():
+    """List all SPH/Quotes in pipeline."""
+    rows = await query_db("SELECT * FROM quotes ORDER BY sent_date DESC, id DESC")
+    return rows
+
+
+@app.get("/api/inaproc/packages")
+async def get_inaproc_packages():
+    """List all procurement opportunities from INAPROC, Mini Kompetisi & LPSE."""
+    from harvey.integrations.inaproc_watcher import InaprocWatcher
+    watcher = InaprocWatcher()
+    pkgs = watcher.load_known_packages()
+    act = watcher.load_activity()
+    items = sorted(pkgs.values(), key=lambda x: x.get("match_score", 0), reverse=True)
+    return {"packages": items, "activity": act, "total": len(items)}
+
+
+@app.post("/api/inaproc/scan")
+async def scan_inaproc_opportunities():
+    """Run an on-demand live procurement scan for Mini Kompetisi & LPSE."""
+    from dataclasses import asdict
+    from harvey.integrations.inaproc_watcher import InaprocWatcher
+    from harvey.config import load_config, load_env
+    from harvey.state import StateManager
+    from harvey.brain import Brain
+
+    config = load_config()
+    env = load_env()
+    state = StateManager()
+    await state.init_db()
+    brain = Brain(state, config.brain)
+
+    watcher = InaprocWatcher()
+    new_packages = await watcher.scan_live_procurement(env, brain)
+    return {
+        "success": True,
+        "new_count": len(new_packages),
+        "new_packages": [asdict(p) if hasattr(p, "__dataclass_fields__") else p for p in new_packages],
+        "activity": watcher.load_activity(),
+    }
+
+
+@app.get("/api/inaproc/session")
+async def get_inaproc_session():
+    """Get authentication and session status for E-Katalog v6."""
+    from harvey.agents.inaproc_agent import InaprocAgent
+    from harvey.config import load_config, load_env
+    from harvey.state import StateManager
+    config = load_config()
+    env = load_env()
+    state = StateManager()
+    await state.init_db()
+    agent = InaprocAgent(state, config, env)
+    return await agent.check_session_status()
+
+
+@app.get("/api/inaproc/bids")
+async def get_inaproc_bids(status: str = ""):
+    """List all Mini Kompetisi bids and submission records."""
+    from harvey.state import StateManager
+    state = StateManager()
+    await state.init_db()
+    bids = await state.get_inaproc_bids(status=status.strip() or None)
+    return {"bids": bids, "total": len(bids)}
+
+
+@app.post("/api/inaproc/copilot")
+async def run_inaproc_copilot():
+    """Trigger the autonomous Mini Kompetisi cycle (scan, match >=20% margin, submit)."""
+    from harvey.agents.inaproc_agent import InaprocAgent
+    from harvey.config import load_config, load_env
+    from harvey.state import StateManager
+    from harvey.brain import Brain
+    config = load_config()
+    env = load_env()
+    state = StateManager()
+    await state.init_db()
+    brain = Brain(state, config.brain)
+    agent = InaprocAgent(state, config, env, brain)
+    results = await agent.run_copilot_cycle(auto_submit=True)
+    return {
+        "success": True,
+        "processed_count": len(results),
+        "results": results,
+    }
+
+
+@app.post("/api/inaproc/bids/{bid_id}/submit")
+async def submit_inaproc_bid(bid_id: str):
+    """Submit penawaran for a specific bid package."""
+    from harvey.agents.inaproc_agent import InaprocAgent
+    from harvey.config import load_config, load_env
+    from harvey.state import StateManager
+    config = load_config()
+    env = load_env()
+    state = StateManager()
+    await state.init_db()
+    agent = InaprocAgent(state, config, env)
+    bids = await state.get_inaproc_bids()
+    target_bid = next((b for b in bids if b["id"] == bid_id), None)
+    if not target_bid:
+        return JSONResponse({"error": "Bid not found"}, status_code=404)
+    res = await agent.submit_bid(bid_id, target_bid)
+    return {"success": True, "result": res}
+
+
+@app.get("/api/vendors")
+async def get_vendors_list():
+    """List verified laboratory equipment principals and distributors."""
+    from harvey.integrations.vendor_directory import load_vendors
+    vendors = load_vendors()
+    return {"vendors": vendors, "total": len(vendors)}
+
+
+@app.post("/api/inaproc/vendor-rfq")
+async def generate_vendor_rfq_endpoint(req: Request):
+    """Generate ready-to-send WhatsApp RFQ for principal."""
+    data = await req.json()
+    item_name = data.get("item_name", "")
+    brand = data.get("brand", "")
+    model = data.get("model", "")
+    package_name = data.get("package_name", "Pengadaan Alat Laboratorium E-Katalog")
+    qty = int(data.get("qty", 1))
+
+    from harvey.integrations.vendor_directory import find_vendor_for_item, build_whatsapp_rfq
+    vendor = find_vendor_for_item(item_name=item_name, brand=brand)
+    if not vendor:
+        return JSONResponse({"error": "No matching vendor found"}, status_code=404)
+
+    rfq_text = build_whatsapp_rfq(
+        vendor=vendor,
+        package_name=package_name,
+        item_name=item_name,
+        brand=brand,
+        model=model,
+        qty=qty,
+    )
+    return {
+        "success": True,
+        "vendor": vendor,
+        "rfq_text": rfq_text,
+        "wa_link": f"https://wa.me/{vendor.get('phone')}?text={quote(rfq_text)}" if vendor.get("phone") else "",
+    }
+
+
+@app.post("/api/inaproc/open-in-chrome")
+async def open_inaproc_in_chrome_endpoint(req: Request):
+    """1-Click Co-Pilot: Open tender package in real Chrome, copy price to clipboard, reveal SPH PDF."""
+    data = await req.json()
+    package_url = data.get("package_url", "https://penyedia.inaproc.id/katalog/paket")
+    bid_price = float(data.get("bid_price", 0))
+    pdf_path = data.get("pdf_path", "")
+
+    from harvey.integrations.vendor_directory import open_inaproc_in_chrome
+    result = open_inaproc_in_chrome(package_url=package_url, bid_price=bid_price, pdf_path=pdf_path)
+    return {"success": True, "result": result}
+
+
+# ── TELEPHONY & CALLING DESK CO-PILOT ENDPOINTS ──
+
+@app.get("/api/telephony/queue")
+async def get_telephony_queue():
+    """Get verified calling queue and dynamic cold calling scripts."""
+    from harvey.config import load_config, load_env
+    from harvey.state import StateManager
+    from harvey.integrations.telephony import TelephonyEngine
+
+    state = StateManager()
+    await state.init_db()
+    engine = TelephonyEngine(state=state, config=load_config(), env=load_env())
+    leads = await engine.get_calling_queue(limit=50)
+
+    # Attach script to each lead
+    for lead in leads:
+        lead["script"] = engine.get_calling_script(lead)
+
+    return {"leads": leads, "total": len(leads)}
+
+
+@app.post("/api/telephony/turn")
+async def telephony_conversational_turn(req: Request):
+    """Process an interactive voice turn: speech synthesis + conversational brain."""
+    import base64
+    from harvey.config import load_config, load_env
+    from harvey.state import StateManager
+    from harvey.integrations.telephony import TelephonyEngine
+
+    data = await req.json()
+    user_speech = data.get("speech", "")
+    lead_context = data.get("lead", {})
+    history = data.get("history", [])
+
+    state = StateManager()
+    await state.init_db()
+    engine = TelephonyEngine(state=state, config=load_config(), env=load_env())
+
+    turn_res = await engine.conversational_turn(
+        user_speech=user_speech,
+        lead_context=lead_context,
+        history=history,
+    )
+
+    reply_text = turn_res.get("reply_text", "Halo, ada yang bisa kami bantu?")
+    audio_bytes, _ = await engine.synthesize_speech(reply_text)
+    b64_audio = base64.b64encode(audio_bytes).decode("ascii")
+
+    return {
+        "success": True,
+        "reply_text": reply_text,
+        "intent": turn_res.get("intent", "general"),
+        "action": turn_res.get("action", "none"),
+        "audio_base64": f"data:audio/mp3;base64,{b64_audio}",
+    }
+
+
+@app.post("/api/telephony/send-comprof")
+async def telephony_send_comprof(req: Request):
+    """Instant action: send Company Profile PDF via WhatsApp to the prospect."""
+    data = await req.json()
+    phone = data.get("phone", "")
+    contact_name = data.get("contact_name", "Bapak/Ibu")
+
+    if not phone:
+        return JSONResponse({"error": "Phone number required"}, status_code=400)
+
+    from harvey.config import load_config, load_env
+    from harvey.state import StateManager
+    from harvey.integrations.whatsapp import WhatsAppEngine
+
+    state = StateManager()
+    await state.init_db()
+    wa_engine = WhatsAppEngine(state=state, config=load_config(), env=load_env())
+
+    pdf_path = PROJECT_ROOT / "data" / "assets" / "give_first" / "Company_Profile_AndisLab.pdf"
+    caption = (
+        f"Halo {contact_name}, terima kasih atas komunikasinya melalui telepon barusan. "
+        "Berikut kami lampirkan berkas resmi *Company Profile & Ringkasan Portofolio PT Andis Sentral Laboratorium (AndisLab)* "
+        "(1.140+ item ready stock Jabodetabek & garansi resmi 12 bulan). "
+        "Katalog online kami juga dapat diakses di www.andislab.com. Terima kasih banyak. 🙏"
+    )
+
+    sent = False
+    if pdf_path.exists():
+        # Try document send first
+        if getattr(wa_engine, "openwa", None) and getattr(wa_engine.openwa, "is_configured", None) and wa_engine.openwa.is_configured():
+            sent = await wa_engine.openwa.send_document(
+                phone=phone,
+                file_path=str(pdf_path),
+                filename="Company_Profile_PT_Andis_Sentral_Laboratorium_2026.pdf",
+                caption=caption,
+            )
+        if not sent:
+            res_doc = await wa_engine._send_document_via_web(phone=phone, caption=caption, pdf_path=pdf_path)
+            sent = res_doc == "sent"
+
+    if not sent:
+        # Fallback text send
+        sent = await wa_engine._send_text_auto(phone=phone, message=caption)
+
+    return {"success": sent, "phone": phone}
+
+
+@app.get("/api/telephony/devices")
+async def telephony_get_devices():
+    """List connected Android devices (tablets/phones) via ADB for GSM calling."""
+    from harvey.integrations.android_bridge import AndroidBridge
+    bridge = AndroidBridge()
+    devices = await bridge.get_devices()
+    primary = await bridge.get_primary_device()
+    return {
+        "devices": devices,
+        "primary": primary,
+        "ready": primary is not None,
+    }
+
+
+@app.post("/api/telephony/dial")
+async def telephony_dial_call(req: Request):
+    """Place an outbound GSM call on the Android tablet using its SIM card."""
+    data = await req.json()
+    phone = data.get("phone", "")
+    serial = data.get("serial")
+    if not phone:
+        return JSONResponse({"success": False, "error": "Nomor telepon wajib diisi."}, status_code=400)
+
+    from harvey.integrations.android_bridge import AndroidBridge
+    bridge = AndroidBridge()
+    res = await bridge.dial_number(phone_number=phone, serial=serial)
+    return res
+
+
+@app.post("/api/telephony/hangup")
+async def telephony_hangup_call(req: Request):
+    """End the ongoing phone call on the connected Android tablet."""
+    try:
+        data = await req.json()
+    except Exception:
+        data = {}
+    serial = data.get("serial")
+
+    from harvey.integrations.android_bridge import AndroidBridge
+    bridge = AndroidBridge()
+    res = await bridge.end_call(serial=serial)
+    return res
+
+
+@app.get("/api/telephony/call-status")
+async def telephony_call_status(serial: str | None = None):
+    """Check current phone call state on Android tablet (IDLE, RINGING, OFFHOOK)."""
+    from harvey.integrations.android_bridge import AndroidBridge
+    bridge = AndroidBridge()
+    res = await bridge.get_call_state(serial=serial)
+    return res
+
+
+@app.get("/api/inventory")
+async def get_inventory(q: str = "", limit: int = 50):
+    """Search inventory items."""
+    if q.strip():
+        sql = "SELECT * FROM inventory WHERE name LIKE ? OR sku LIKE ? OR brand LIKE ? LIMIT ?"
+        p = f"%{q.strip()}%"
+        rows = await query_db(sql, (p, p, p, limit))
+    else:
+        rows = await query_db("SELECT * FROM inventory ORDER BY name ASC LIMIT ?", (limit,))
+    total_rows = await query_db("SELECT count(*) as n FROM inventory")
+    total = total_rows[0]["n"] if total_rows else 0
+    return {"items": rows, "total": total}
+
+
 @app.get("/api/activity")
-async def get_activity():
-    rows = await query_db("SELECT * FROM actions ORDER BY created_at DESC LIMIT 100")
+async def get_activity(range: str = "all"):
+    rng = (range or "all").lower()
+    where_clause = ""
+    if rng == "today":
+        where_clause = "WHERE date(created_at, '+7 hours') = date('now', '+7 hours')"
+    elif rng == "yesterday":
+        where_clause = "WHERE date(created_at, '+7 hours') = date('now', '+7 hours', '-1 day')"
+    elif rng == "week":
+        where_clause = "WHERE date(created_at, '+7 hours') >= date('now', '+7 hours', '-7 days')"
+
+    rows = await query_db(f"SELECT * FROM actions {where_clause} ORDER BY created_at DESC LIMIT 150")
     for row in rows:
         try:
             row["details"] = json.loads(row.get("details_json", "{}"))
@@ -1900,22 +2728,722 @@ def _require_approval_now() -> bool:
         return True
 
 
-@app.get("/api/today")
-async def get_today():
-    """What needs a human, right now.
+@app.get("/api/quotes/kanban")
+async def get_quotes_kanban():
+    """Return all SPH / Quotations for the Kanban CRM Pipeline tab."""
+    try:
+        rows = await query_db(
+            "SELECT id, prospect_id, company, contact_name, phone, email, "
+            "items_summary, total_amount, sent_date, status, stage, last_followup_at, notes, "
+            "expected_close_date, probability_pct, blocker, next_action "
+            "FROM quotes ORDER BY total_amount DESC"
+        )
+        return {"quotes": rows, "total_count": len(rows), "total_value": sum(float(r.get("total_amount") or 0) for r in rows)}
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
 
-    The dashboard opens here rather than on a setup checklist: the question a
-    returning user actually has is "is anything waiting on me?", and the
-    answer is usually a short list or nothing at all.
-    """
+
+@app.get("/api/forecast")
+async def get_forecast():
+    """Return Weighted Revenue Forecast & Closing Calendar grouped by target window."""
+    try:
+        rows = await query_db(
+            "SELECT id, prospect_id, company, contact_name, phone, email, "
+            "items_summary, total_amount, sent_date, status, stage, last_followup_at, "
+            "COALESCE(expected_close_date, '') AS expected_close_date, "
+            "COALESCE(probability_pct, 20) AS probability_pct, "
+            "COALESCE(blocker, '') AS blocker, "
+            "COALESCE(next_action, '') AS next_action "
+            "FROM quotes ORDER BY probability_pct DESC, total_amount DESC"
+        )
+        total_pipeline = 0.0
+        weighted_forecast = 0.0
+        closed_won_value = 0.0
+        this_week_value = 0.0
+        next_week_value = 0.0
+        december_value = 0.0
+        stalled_count = 0
+
+        from datetime import date
+        today_d = date.today()
+
+        for r in rows:
+            amt = float(r.get("total_amount") or 0)
+            prob = float(r.get("probability_pct") or 20)
+            st = (r.get("status") or "pending").lower()
+            dt = (r.get("expected_close_date") or "").strip()
+
+            # Compute Deal Health (Pipeline Analyst)
+            ref_date_str = (r.get("last_followup_at") or r.get("sent_date") or "").strip()
+            days_idle = 0
+            if ref_date_str:
+                try:
+                    days_idle = (today_d - date.fromisoformat(ref_date_str[:10])).days
+                except Exception:
+                    days_idle = 0
+            r["days_idle"] = days_idle
+
+            if st == "closed_won":
+                r["health"] = "WON"
+            elif st == "closed_lost":
+                r["health"] = "LOST"
+            elif days_idle >= 12 and st == "pending":
+                r["health"] = "MACET"
+                stalled_count += 1
+            elif days_idle >= 7:
+                r["health"] = "PERLU_FU"
+            else:
+                r["health"] = "SEHAT"
+
+            if st == "closed_lost":
+                continue
+            total_pipeline += amt
+            weighted_forecast += amt * (prob / 100.0)
+            if st == "closed_won":
+                closed_won_value += amt
+            elif dt and dt <= "2026-11-22":
+                this_week_value += amt
+            elif dt and dt <= "2026-11-30":
+                next_week_value += amt
+            else:
+                december_value += amt
+
+        return {
+            "summary": {
+                "total_pipeline": total_pipeline,
+                "weighted_forecast": round(weighted_forecast),
+                "closed_won_value": closed_won_value,
+                "this_week_value": this_week_value,
+                "next_week_value": next_week_value,
+                "december_value": december_value,
+                "stalled_count": stalled_count,
+                "total_count": len(rows),
+            },
+            "quotes": rows,
+        }
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.post("/api/quotes/{quote_id}/forecast")
+async def update_quote_forecast(quote_id: str, request: Request):
+    """Update expected_close_date, probability_pct, blocker, and next_action for an SPH."""
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    dt = str(body.get("expected_close_date") or "").strip()
+    prob = max(0, min(100, int(body.get("probability_pct") or 20)))
+    blocker = str(body.get("blocker") or "").strip()
+    next_action = str(body.get("next_action") or "").strip()
+    try:
+        import aiosqlite
+        async with aiosqlite.connect(PROJECT_ROOT / "data" / "harvey.db", timeout=30.0) as db:
+            await db.execute(
+                "UPDATE quotes SET expected_close_date = ?, probability_pct = ?, blocker = ?, next_action = ? WHERE id = ?",
+                (dt, prob, blocker, next_action, quote_id),
+            )
+            await db.commit()
+        return {"success": True, "id": quote_id}
+    except Exception as e:
+        return JSONResponse({"success": False, "message": str(e)}, status_code=500)
+
+
+@app.post("/api/quotes/{quote_id}/status")
+async def update_quote_status(quote_id: str, request: Request):
+    """Move an SPH deal to another Kanban CRM stage."""
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    new_status = str((body or {}).get("status") or "").strip().lower()
+    allowed = {"pending", "replied", "visit_nego", "closed_won", "closed_lost", "no_wa"}
+    if new_status not in allowed:
+        return JSONResponse({"success": False, "message": "Status tidak valid."}, status_code=400)
+    try:
+        import aiosqlite
+        async with aiosqlite.connect(PROJECT_ROOT / "data" / "harvey.db", timeout=30.0) as db:
+            await db.execute("UPDATE quotes SET status = ? WHERE id = ?", (new_status, quote_id))
+            await db.commit()
+        return {"success": True, "id": quote_id, "status": new_status}
+    except Exception as e:
+        return JSONResponse({"success": False, "message": str(e)}, status_code=500)
+
+
+_BIGDATA_CACHE: dict = {"ts": 0.0, "data": None}
+
+
+@app.post("/api/prospects/add")
+async def add_prospect_manual(request: Request):
+    """Self-service: add or update a prospect directly from Contacts tab."""
+    body = await request.json() if request else {}
+    company = str((body or {}).get("company") or "").strip()
+    first_name = str((body or {}).get("first_name") or "").strip() or "Tim Pengadaan"
+    raw_phone = str((body or {}).get("phone") or "").strip()
+    email = str((body or {}).get("email") or "").strip()
+    title = str((body or {}).get("title") or "").strip() or "PIC Lab / Pengadaan"
+    if not company and not raw_phone and not email:
+        return JSONResponse({"success": False, "message": "Minimal isi Perusahaan dan Nomor WA atau Email."}, status_code=400)
+    from harvey.integrations.whatsapp import normalize_id_phone
+    norm_ph = normalize_id_phone(raw_phone) if raw_phone else ""
+    now_iso = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
+    pid = f"manual_{uuid.uuid4().hex[:10]}"
+    async with _state()._connect() as db:
+        if norm_ph:
+            ex = await (await db.execute("SELECT id FROM prospects WHERE phone = ? LIMIT 1", (norm_ph,))).fetchone()
+            if ex:
+                return JSONResponse({"success": False, "message": f"Nomor WA {norm_ph} sudah terdaftar (ID: {ex[0]})."}, status_code=409)
+        if email:
+            ex_em = await (await db.execute("SELECT id FROM prospects WHERE lower(email) = lower(?) LIMIT 1", (email,))).fetchone()
+            if ex_em:
+                return JSONResponse({"success": False, "message": f"Email {email} sudah terdaftar (ID: {ex_em[0]})."}, status_code=409)
+        await db.execute(
+            """INSERT INTO prospects
+               (id, first_name, last_name, company, title, email, email_status, phone, status, source, created_at, updated_at)
+               VALUES (?, ?, '', ?, ?, ?, ?, ?, 'queued', 'manual_dashboard', ?, ?)""",
+            (pid, first_name, company, title, email or None, "verified" if email else "unknown", norm_ph or None, now_iso, now_iso),
+        )
+        await db.commit()
+    return {"success": True, "id": pid, "phone": norm_ph}
+
+
+@app.post("/api/quotes/add")
+async def add_quote_manual(request: Request):
+    """Self-service: add a new SPH quote directly from Pipeline SPH tab."""
+    body = await request.json() if request else {}
+    qid = str((body or {}).get("id") or "").strip() or f"QUO-{uuid.uuid4().hex[:4].upper()}"
+    company = str((body or {}).get("company") or "").strip()
+    contact_name = str((body or {}).get("contact_name") or "").strip()
+    raw_phone = str((body or {}).get("phone") or "").strip()
+    items_summary = str((body or {}).get("items_summary") or "").strip()
+    total_amount = float((body or {}).get("total_amount") or 0)
+    if not company:
+        return JSONResponse({"success": False, "message": "Nama perusahaan/instansi wajib diisi."}, status_code=400)
+    from harvey.integrations.whatsapp import normalize_id_phone
+    norm_ph = normalize_id_phone(raw_phone) if raw_phone else ""
+    today_str = datetime.now(timezone(timedelta(hours=7))).strftime("%Y-%m-%d")
+    async with _state()._connect() as db:
+        pid = ""
+        if norm_ph:
+            r = await (await db.execute("SELECT id FROM prospects WHERE phone = ? LIMIT 1", (norm_ph,))).fetchone()
+            if r:
+                pid = r[0]
+        await db.execute(
+            """INSERT OR REPLACE INTO quotes
+               (id, prospect_id, company, contact_name, phone, items_summary, total_amount, sent_date, status, stage)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0)""",
+            (qid, pid, company, contact_name, norm_ph or raw_phone, items_summary, total_amount, today_str),
+        )
+        await db.commit()
+    return {"success": True, "id": qid}
+
+
+@app.get("/api/settings/mahoraga")
+async def get_mahoraga_settings():
+    """Return Tokenizer.id + WA auto mode + geography + partner exclusions for self-service Settings."""
+    import os
+    from harvey.config import load_config, load_env
+    load_env()
+    cfg = load_config("harvey.local.yaml")
+    tok_key = os.getenv("TOKENIZER_API_KEY", "")
+    masked_key = (tok_key[:8] + "..." + tok_key[-4:]) if len(tok_key) > 12 else ("Set" if tok_key else "")
+    return {
+        "success": True,
+        "tokenizer_key_masked": masked_key,
+        "tokenizer_base_url": os.getenv("TOKENIZER_BASE_URL", "https://tokenizer.id/v1"),
+        "tokenizer_model": os.getenv("TOKENIZER_MODEL", "gpt-6.1-sol"),
+        "wa_auto_mode": getattr(cfg.channels.whatsapp, "auto_reply_mode", "full_auto"),
+        "wa_max_daily": getattr(cfg.channels.whatsapp, "max_daily_messages", 30),
+        "geography": getattr(cfg.icp, "geography", []),
+        "partner_exclusions": getattr(cfg.compliance, "partner_exclusions", []),
+    }
+
+
+@app.post("/api/settings/mahoraga")
+async def save_mahoraga_settings(request: Request):
+    """Persist Tokenizer.id (.env) & MAHORAGA runtime settings (harvey.local.yaml) directly."""
+    import os, yaml
+    from harvey.paths import PROJECT_ROOT
+    body = await request.json() if request else {}
+
+    # 1. Update .env for Tokenizer settings if provided
+    env_path = PROJECT_ROOT / ".env"
+    env_lines = env_path.read_text(encoding="utf-8").splitlines() if env_path.exists() else []
+    updates = {}
+    if str(body.get("tokenizer_api_key") or "").strip():
+        updates["TOKENIZER_API_KEY"] = str(body["tokenizer_api_key"]).strip()
+    if str(body.get("tokenizer_base_url") or "").strip():
+        updates["TOKENIZER_BASE_URL"] = str(body["tokenizer_base_url"]).strip()
+    if str(body.get("tokenizer_model") or "").strip():
+        updates["TOKENIZER_MODEL"] = str(body["tokenizer_model"]).strip()
+    if updates:
+        new_lines = []
+        seen = set()
+        for ln in env_lines:
+            k = ln.split("=", 1)[0].strip() if "=" in ln and not ln.strip().startswith("#") else ""
+            if k in updates:
+                new_lines.append(f"{k}={updates[k]}")
+                os.environ[k] = updates[k]
+                seen.add(k)
+            else:
+                new_lines.append(ln)
+        for k, v in updates.items():
+            if k not in seen:
+                new_lines.append(f"{k}={v}")
+                os.environ[k] = v
+        env_path.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+
+    # 2. Update harvey.local.yaml cleanly
+    yaml_path = PROJECT_ROOT / "harvey.local.yaml"
+    data = yaml.safe_load(yaml_path.read_text(encoding="utf-8")) if yaml_path.exists() else {}
+    if isinstance(data, dict):
+        if body.get("wa_auto_mode"):
+            data.setdefault("channels", {}).setdefault("whatsapp", {})["auto_reply_mode"] = str(body["wa_auto_mode"]).strip()
+        if body.get("wa_max_daily"):
+            data.setdefault("channels", {}).setdefault("whatsapp", {})["max_daily_messages"] = int(body["wa_max_daily"])
+        if isinstance(body.get("geography"), str) and body["geography"].strip():
+            data.setdefault("icp", {})["geography"] = [g.strip() for g in body["geography"].split(",") if g.strip()]
+        if isinstance(body.get("partner_exclusions"), str):
+            data.setdefault("compliance", {})["partner_exclusions"] = [p.strip() for p in body["partner_exclusions"].split(",") if p.strip()]
+        yaml_path.write_text(yaml.safe_dump(data, allow_unicode=True, sort_keys=False), encoding="utf-8")
+    return {"success": True, "message": "Pengaturan disimpan ke .env & harvey.local.yaml."}
+
+
+_SOURCING_PROGRESS: dict[str, dict] = {}
+
+
+@app.get("/api/sourcing/progress/{job_id}")
+async def get_sourcing_progress(job_id: str):
+    """Live step & log progress for an in-flight Sourcing Barang job."""
+    st = _SOURCING_PROGRESS.get(job_id) or {"step": 0, "done": False, "logs": []}
+    return {"success": True, **st}
+
+
+@app.post("/api/sourcing/contact-vendor")
+async def contact_sourcing_vendor(request: Request):
+    """Send Blind RFQ to a vendor via WhatsApp and activate VENDOR_NEGOTIATION mode."""
+    body = await request.json() if request else {}
+    vendor_name = str((body or {}).get("vendor_name") or "Vendor").strip()
+    raw_phone = str((body or {}).get("vendor_phone") or "").strip()
+    rfq_text = str((body or {}).get("rfq_text") or "").strip()
+    item_name = str((body or {}).get("item_name") or "").strip()
+    if not raw_phone or not rfq_text:
+        return JSONResponse({"success": False, "message": "Nomor WA vendor dan isi RFQ wajib diisi."}, status_code=400)
+    try:
+        from harvey.config import load_config
+        from harvey.integrations.openwa import OpenWAClient
+        from harvey.integrations.whatsapp import normalize_id_phone
+        norm_ph = normalize_id_phone(raw_phone)
+        if not norm_ph:
+            return JSONResponse({"success": False, "message": "Format nomor WA vendor tidak valid."}, status_code=400)
+        cfg = load_config()
+        w = cfg.channels.whatsapp
+        wa = OpenWAClient(w.openwa_base_url, w.openwa_api_key, w.openwa_session_id)
+        ok = await wa.send_text(norm_ph, rfq_text)
+        if not ok:
+            return JSONResponse({"success": False, "message": f"Gagal kirim WA ke {norm_ph} via OpenWA."}, status_code=502)
+
+        now_iso = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
+        pid = f"vendor_{norm_ph}"
+        cid = f"wa_vendor_{norm_ph[-10:]}"
+        async with _state()._connect() as db:
+            await db.execute(
+                """INSERT OR IGNORE INTO prospects
+                   (id, first_name, last_name, company, title, phone, status, source, personalization_notes, created_at, updated_at)
+                   VALUES (?, ?, '', ?, 'Supplier / Vendor', ?, 'contacted', 'vendor_sourcing', '[WA_SENT:vendor_rfq]', ?, ?)""",
+                (pid, vendor_name, vendor_name, norm_ph, now_iso, now_iso),
+            )
+            th = [{"direction": "outbound", "channel": "whatsapp", "content": rfq_text, "text": rfq_text, "sender": "AndisLab (Purchasing)", "timestamp": now_iso}]
+            await db.execute(
+                """INSERT OR REPLACE INTO conversations
+                   (id, prospect_id, channel, status, intent, thread_json, created_at, updated_at)
+                   VALUES (?, ?, 'whatsapp', 'open', 'VENDOR_NEGOTIATION', ?, ?, ?)""",
+                (cid, pid, json.dumps(th), now_iso, now_iso),
+            )
+            await db.commit()
+        await _state().log_action(
+            action_type="vendor_rfq_sent",
+            agent="handler",
+            details={"company": f"RFQ Vendor: {vendor_name} ({item_name})", "phone": norm_ph},
+        )
+        return {"success": True, "phone": norm_ph, "conversation_id": cid}
+    except Exception as e:
+        return JSONResponse({"success": False, "message": str(e)}, status_code=500)
+
+
+@app.post("/api/sourcing")
+async def run_product_sourcing(request: Request):
+    """Run multi-source product sourcing from natural-language prompt (like ChatGPT/Gemini)."""
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    raw_input = str((body or {}).get("query") or "").strip()
+    if not raw_input:
+        return JSONResponse({"success": False, "message": "Nama barang atau spesifikasi wajib diisi."}, status_code=400)
+    explicit_qty = (body or {}).get("qty")
+    margin_raw = (body or {}).get("margin_pct")
+    explicit_budget = float((body or {}).get("budget_idr") or 0)
+    job_id = str((body or {}).get("job_id") or "").strip()
+
+    def _log_prog(step: int, msg: str, done: bool = False):
+        if not job_id:
+            return
+        cur = _SOURCING_PROGRESS.setdefault(job_id, {"step": 1, "done": False, "logs": []})
+        cur["step"] = step
+        cur["done"] = done
+        cur["logs"].append(f"[{datetime.now(timezone(timedelta(hours=7))).strftime('%H:%M:%S')}] {msg}")
+
+    try:
+        from harvey.brain import Brain
+        from harvey.config import load_config, load_env
+        from harvey.integrations.sourcing import SourcingEngine
+        cfg = load_config()
+        env = load_env()
+        st = _state()
+        await st.init_db()
+        brain = Brain(st, cfg.brain)
+
+        _log_prog(1, f"Memahami permintaan: '{raw_input[:60]}'...")
+        # Smart ChatGPT-style intent extraction (clean product query, qty, budget, margin)
+        parsed_intent = {"product_query": raw_input, "qty": 1, "budget_idr": 0, "margin_pct": None}
+        if len(raw_input.split()) >= 4:
+            try:
+                ext_prompt = (
+                    "Ekstrak permintaan sourcing barang berikut menjadi JSON murni:\n"
+                    f'Teks: "{raw_input}"\n'
+                    'Format: {"product_query": "nama barang/model/spek bersih tanpa kata budget/carikan/tolong", '
+                    '"qty": 1, "budget_idr": 0, "margin_pct": null}\n'
+                    "Contoh: '5jt' -> 5000000, '4 juta' -> 4000000. Kembalikan JSON saja."
+                )
+                ext = await brain.think_json(prompt=ext_prompt, agent="sourcing_parser")
+                if isinstance(ext, dict) and ext.get("product_query"):
+                    parsed_intent["product_query"] = str(ext["product_query"]).strip()
+                    parsed_intent["qty"] = int(ext.get("qty") or 1)
+                    parsed_intent["budget_idr"] = float(ext.get("budget_idr") or 0)
+                    if ext.get("margin_pct") is not None:
+                        parsed_intent["margin_pct"] = float(ext["margin_pct"])
+            except Exception:
+                pass
+
+        qty = int(explicit_qty) if explicit_qty not in (None, "", 0) else parsed_intent["qty"]
+        eff_margin_val = float(margin_raw) if margin_raw not in (None, "") else parsed_intent["margin_pct"]
+        margin_pct = (eff_margin_val / 100.0) if eff_margin_val is not None else None
+        eff_budget = explicit_budget or parsed_intent["budget_idr"]
+
+        _log_prog(2, f"Cek stok gudang internal (1.142 SKU + LanceDB) untuk '{parsed_intent['product_query']}'...")
+        _log_prog(3, "Mencari vendor paralel via Tavily + Serper Google ID + INAPROC E-Katalog...")
+        _log_prog(4, "Membaca halaman harga & spesifikasi supplier (Firecrawl + HTTP)...")
+        engine = SourcingEngine(brain, env, cfg, st)
+        res = await engine.source_item(raw_query=parsed_intent["product_query"], qty=qty, margin_pct=margin_pct)
+        _log_prog(5, f"Selesai: {res.get('total_candidates', 0)} vendor ditemukan dari {len(res.get('source_urls') or [])} URL.", done=True)
+        res["parsed_intent"] = {
+            "product_query": parsed_intent["product_query"],
+            "qty": qty,
+            "budget_idr": eff_budget,
+        }
+        await st.log_action(
+            action_type="sourcing_completed",
+            agent="scout",
+            details={"company": f"Sourcing: {res.get('canonical_name') or parsed_intent['product_query']}", "candidates": res.get("total_candidates", 0)},
+        )
+        return {"success": True, "result": res}
+    except Exception as e:
+        _log_prog(5, f"Error: {e}", done=True)
+        return JSONResponse({"success": False, "message": str(e)}, status_code=500)
+
+
+@app.get("/api/sourcing/history")
+async def get_sourcing_history():
+    """Return recent product sourcing tickets."""
+    rows = await query_db(
+        "SELECT id, raw_query, clean_query, qty, status, created_at FROM sourcing_requests ORDER BY created_at DESC LIMIT 20"
+    )
+    return {"success": True, "items": rows}
+
+
+@app.get("/api/visits/tomorrow")
+async def get_visits_tomorrow():
+    """Return prioritized Jabodetabek/Karawang/Bekasi/Bogor visit candidates for tomorrow."""
+    rows = await query_db(
+        """SELECT p.id, p.first_name, p.company, p.phone, p.email, p.status, p.updated_at,
+                  CASE
+                    WHEN lower(coalesce(p.company,'')) LIKE '%karawang%' OR lower(coalesce(p.company,'')) LIKE '%kiic%' THEN 'Karawang/KIIC'
+                    WHEN lower(coalesce(p.company,'')) LIKE '%cikarang%' OR lower(coalesce(p.company,'')) LIKE '%bekasi%' THEN 'Bekasi/Cikarang'
+                    WHEN lower(coalesce(p.company,'')) LIKE '%bogor%' THEN 'Bogor'
+                    ELSE 'Jabodetabek'
+                  END AS area
+           FROM prospects p
+           WHERE coalesce(p.phone,'') LIKE '628%'
+             AND p.status NOT IN ('opted_out', 'lost')
+             AND coalesce(p.personalization_notes,'') NOT LIKE '%[REFERRED_TO_PIC%'
+             AND (
+               lower(coalesce(p.company,'')) LIKE '%karawang%'
+               OR lower(coalesce(p.company,'')) LIKE '%kiic%'
+               OR lower(coalesce(p.company,'')) LIKE '%cikarang%'
+               OR lower(coalesce(p.company,'')) LIKE '%bekasi%'
+               OR lower(coalesce(p.company,'')) LIKE '%bogor%'
+             )
+           ORDER BY CASE WHEN p.status = 'replied' THEN 0 ELSE 1 END, p.updated_at DESC
+           LIMIT 25"""
+    )
+    return {"success": True, "count": len(rows), "candidates": rows}
+
+
+@app.get("/api/office")
+async def get_virtual_office():
+    """Live state for the Virtual Sales Office (6 MAHORAGA agents + live terminal feed)."""
+    try:
+        recent_actions = await query_db(
+            "SELECT id, agent, action_type, details_json, created_at FROM actions ORDER BY created_at DESC LIMIT 60"
+        )
+        today_counts = {
+            r["agent"]: r["n"]
+            for r in await query_db(
+                "SELECT agent, count(*) AS n FROM actions WHERE date(created_at, '+7 hours') = date('now', '+7 hours') GROUP BY agent"
+            )
+        }
+        ob_pending = (await query_db("SELECT count(*) AS n FROM outbox WHERE status = 'pending_review'"))[0]["n"]
+        ob_approved = (await query_db("SELECT count(*) AS n FROM outbox WHERE status = 'approved'"))[0]["n"]
+        inaproc_cnt = (await query_db("SELECT count(*) AS n FROM inaproc_bids"))[0]["n"]
+        prospects_today = (await query_db("SELECT count(*) AS n FROM prospects WHERE date(created_at, '+7 hours') = date('now', '+7 hours')"))[0]["n"]
+        inv_total = (await query_db("SELECT count(*) AS n FROM inventory"))[0]["n"]
+        critic_today = (await query_db("SELECT count(*) AS n FROM actions WHERE action_type = 'critic_alert' AND date(created_at, '+7 hours') = date('now', '+7 hours')"))[0]["n"]
+        outbox_failed_7d = (await query_db("SELECT count(*) AS n FROM outbox WHERE status = 'failed' AND created_at >= datetime('now', '-7 days')"))[0]["n"]
+        wa_sent_today = (await query_db("SELECT count(*) AS n FROM actions WHERE action_type IN ('whatsapp_sent', 'whatsapp_reply', 'whatsapp_reply_sent', 'whatsapp_followup') AND date(created_at, '+7 hours') = date('now', '+7 hours')"))[0]["n"]
+        idx_row = await query_db("SELECT value FROM settings WHERE key = 'bigdata_last_index_ts'")
+        last_idx_ts = float(idx_row[0]["value"]) if idx_row and idx_row[0].get("value") else 0.0
+        bigdata_is_fresh = last_idx_ts > 0
+
+        latest_by_agent: dict[str, dict] = {}
+        feed: list[dict] = []
+        for a in recent_actions:
+            ag = (a.get("agent") or "main").lower()
+            atype = a.get("action_type") or ""
+            try:
+                det = json.loads(a.get("details_json") or "{}")
+            except Exception:
+                det = {}
+            if atype == "handle_replies" and not det:
+                continue
+            summary = det.get("company") or det.get("campaign_name") or det.get("phone") or det.get("to") or atype
+            if ag not in latest_by_agent:
+                latest_by_agent[ag] = {"action": atype, "summary": str(summary or ""), "at": a.get("created_at")}
+            feed.append({
+                "agent": ag,
+                "action_type": atype,
+                "summary": str(summary or "")[:70],
+                "created_at": a.get("created_at"),
+            })
+
+        def _is_recent(iso_str: str | None) -> bool:
+            if not iso_str:
+                return False
+            try:
+                s = str(iso_str).replace(" ", "T").replace("Z", "")
+                dt = datetime.fromisoformat(s)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                return (datetime.now(timezone.utc) - dt).total_seconds() <= 1200
+            except Exception:
+                return False
+
+        agents = [
+            {
+                "id": "scout",
+                "name": "Scout",
+                "role": "Pencari Prospek & Universe",
+                "status": "working" if _is_recent((latest_by_agent.get("scout") or {}).get("at")) else "standby",
+                "today_count": today_counts.get("scout", 0) + prospects_today,
+                "metric_label": "prospek/aksi hari ini",
+                "last_task": (latest_by_agent.get("scout") or {}).get("summary") or "Siap mencari prospek 4 segmen",
+                "last_at": (latest_by_agent.get("scout") or {}).get("at") or "",
+            },
+            {
+                "id": "writer",
+                "name": "Writer",
+                "role": "Penulis Email & Personalisasi",
+                "status": "working" if _is_recent((latest_by_agent.get("writer") or {}).get("at")) else "standby",
+                "today_count": today_counts.get("writer", 0),
+                "metric_label": "campaign ditulis hari ini",
+                "last_task": (latest_by_agent.get("writer") or {}).get("summary") or "Siap menulis draf personal",
+                "last_at": (latest_by_agent.get("writer") or {}).get("at") or "",
+            },
+            {
+                "id": "handler",
+                "name": "Handler (WA/Email)",
+                "role": "Penjawab Chat & Closing",
+                "status": "working" if _is_recent((latest_by_agent.get("handler") or {}).get("at")) else ("waiting" if ob_pending > 0 else "standby"),
+                "today_count": today_counts.get("handler", 0),
+                "metric_label": "balasan diproses hari ini",
+                "last_task": (latest_by_agent.get("handler") or {}).get("summary") or "Memantau webhook WA & IMAP",
+                "last_at": (latest_by_agent.get("handler") or {}).get("at") or "",
+            },
+            {
+                "id": "sender",
+                "name": "Sender & Chaser",
+                "role": "Pengirim Outbox & Follow-Up SPH",
+                "status": "working" if _is_recent((latest_by_agent.get("sender") or {}).get("at")) else ("waiting" if ob_approved > 0 else "standby"),
+                "today_count": today_counts.get("sender", 0) + today_counts.get("whatsapp", 0),
+                "metric_label": f"terkirim hari ini ({ob_approved} antre)",
+                "last_task": (latest_by_agent.get("sender") or latest_by_agent.get("whatsapp") or {}).get("summary") or "Menjaga ritme pengiriman",
+                "last_at": (latest_by_agent.get("sender") or latest_by_agent.get("whatsapp") or {}).get("at") or "",
+            },
+            {
+                "id": "inaproc",
+                "name": "Radar INAPROC",
+                "role": "Pemburu Tender E-Katalog v6",
+                "status": "working" if _is_recent((latest_by_agent.get("inaproc") or {}).get("at")) else "standby",
+                "today_count": inaproc_cnt,
+                "metric_label": "paket terdeteksi",
+                "last_task": (latest_by_agent.get("inaproc") or {}).get("summary") or "Patroli paket mini kompetisi",
+                "last_at": (latest_by_agent.get("inaproc") or {}).get("at") or "",
+            },
+            {
+                "id": "bigdata",
+                "name": "Big Data & Critic",
+                "role": "Memori LanceDB & Anti-Halu",
+                "status": "working" if (bigdata_is_fresh or critic_today > 0) else "standby",
+                "today_count": inv_total,
+                "metric_label": f"SKU terindeks · {critic_today} alert halu hari ini",
+                "last_task": f"{inv_total} SKU + Memori Chat + Critic ({critic_today} alert)",
+                "last_at": (latest_by_agent.get("bigdata") or {}).get("at") or "",
+            },
+        ]
+
+        # Lightweight System Health telemetry (OpenWA, Brain, WA Quota, Outbox Failed, Free RAM)
+        openwa_ready = False
+        wa_max_daily = 30
+        brain_provider = "gemini"
+        try:
+            from harvey.config import load_config
+            from harvey.integrations.openwa import OpenWAClient
+            cfg_now = load_config()
+            wa_max_daily = getattr(cfg_now.channels.whatsapp, "max_daily_messages", 30)
+            brain_provider = getattr(cfg_now.brain, "provider", "gemini")
+            ow = OpenWAClient(
+                cfg_now.channels.whatsapp.openwa_base_url,
+                cfg_now.channels.whatsapp.openwa_api_key,
+                cfg_now.channels.whatsapp.openwa_session_id,
+            )
+            openwa_ready = await ow.check_health()
+        except Exception:
+            pass
+
+        free_ram_gb = None
+        try:
+            import ctypes
+            class _MEMSTAT(ctypes.Structure):
+                _fields_ = [
+                    ("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+                    ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("sullAvailExtendedVirtual", ctypes.c_ulonglong),
+                ]
+            ms = _MEMSTAT()
+            ms.dwLength = ctypes.sizeof(_MEMSTAT)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(ms)):
+                free_ram_gb = round(ms.ullAvailPhys / (1024 ** 3), 2)
+        except Exception:
+            pass
+
+        return {
+            "success": True,
+            "agents": agents,
+            "feed": feed[:20],
+            "queue": {"pending_review": ob_pending, "approved": ob_approved},
+            "health": {
+                "openwa_ready": openwa_ready,
+                "brain_provider": brain_provider,
+                "wa_sent_today": wa_sent_today,
+                "wa_max_daily": wa_max_daily,
+                "outbox_failed_7d": outbox_failed_7d,
+                "free_ram_gb": free_ram_gb,
+            },
+        }
+    except Exception as e:
+        return JSONResponse({"success": False, "message": str(e)}, status_code=500)
+
+
+@app.get("/api/bigdata")
+async def get_bigdata_analytics():
+    """Return LanceDB vector counts, 4-vertical segment coverage, Win/Loss & top equipment analytics."""
+    try:
+        from harvey.integrations.big_data import MahoragaBigData
+        from harvey.integrations.universe_harvester import UNIVERSE_BLUEPRINTS
+
+        now_m = time.monotonic()
+        if _BIGDATA_CACHE["data"] is not None and (now_m - _BIGDATA_CACHE["ts"]) < 30.0:
+            analytics = _BIGDATA_CACHE["data"]
+        else:
+            analytics = await asyncio.to_thread(MahoragaBigData().get_analytics)
+            _BIGDATA_CACHE["data"] = analytics
+            _BIGDATA_CACHE["ts"] = now_m
+        blueprints = [
+            {
+                "key": k,
+                "label": v["label"],
+                "target_pics": v["target_pics"],
+                "typical_equipment": v["typical_equipment"],
+            }
+            for k, v in UNIVERSE_BLUEPRINTS.items()
+        ]
+        return {"success": True, "analytics": analytics, "blueprints": blueprints}
+    except Exception as e:
+        return JSONResponse({"success": False, "message": str(e)}, status_code=500)
+
+
+@app.post("/api/bigdata/rebuild")
+async def rebuild_bigdata_index():
+    """Rebuild local LanceDB vector indexes from inventory.json & harvey.db."""
+    try:
+        from harvey.integrations.big_data import MahoragaBigData
+
+        res = await asyncio.to_thread(MahoragaBigData().build_all_indexes)
+        _BIGDATA_CACHE["ts"] = 0.0
+        return {"success": True, "result": res}
+    except Exception as e:
+        return JSONResponse({"success": False, "message": str(e)}, status_code=500)
+
+
+@app.post("/api/bigdata/harvest")
+async def trigger_universe_harvest(request: Request):
+    """Run balanced multi-segment Indonesian lab discovery across Industri, RS, Kampus, Pemerintah."""
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    max_per_seg = int((body or {}).get("max_per_segment") or 3)
+    max_per_seg = max(1, min(10, max_per_seg))
+    try:
+        from harvey.integrations.universe_harvester import UniverseHarvester
+
+        res = await UniverseHarvester().harvest_balanced_universe(max_per_segment=max_per_seg)
+        _BIGDATA_CACHE["ts"] = 0.0
+        return {"success": True, "result": res}
+    except Exception as e:
+        return JSONResponse({"success": False, "message": str(e)}, status_code=500)
+
+
+_TODAY_INITIALIZED = False
+
+
+@app.get("/api/today")
+async def get_today(range: str = "all"):
+    """Dashboard overview & timeframe-filtered metrics (today / week / month / all)."""
+    global _TODAY_INITIALIZED
     items: list[dict] = []
     stats: dict = {}
     try:
-        from harvey.signals import seed_signal_catalog
-
         state = _state()
-        await state.init_db()
-        await seed_signal_catalog(state)
+        if not _TODAY_INITIALIZED:
+            from harvey.signals import seed_signal_catalog
+            await state.init_db()
+            await seed_signal_catalog(state)
+            _TODAY_INITIALIZED = True
 
         codes = await state.get_signal_codes()
         proposed = [c for c in codes if c.get("status") == "proposed"]
@@ -1937,7 +3465,119 @@ async def get_today():
         n_companies = companies[0]["n"] if companies else 0
 
         unprofiled_count = await state.count_companies_needing_profile()
+
+        # WhatsApp stats
+        wa_today = 0
+        wa_file = PROJECT_ROOT / "data" / "whatsapp_activity.json"
+        if wa_file.exists():
+            try:
+                wa_data = json.loads(wa_file.read_text(encoding="utf-8"))
+                wa_today = wa_data.get("sent", 0)
+            except Exception:
+                pass
+        wa_total_rows = await query_db("SELECT count(*) AS n FROM actions WHERE action_type = 'whatsapp_sent'")
+        wa_total = wa_total_rows[0]["n"] if wa_total_rows else 0
+        phone_rows = await query_db("SELECT count(*) AS n FROM prospects WHERE phone IS NOT NULL AND trim(phone) != ''")
+        prospects_with_phone = phone_rows[0]["n"] if phone_rows else 0
+
+        # Quotes / SPH stats
+        quotes_rows = await query_db("SELECT count(*) AS n, coalesce(sum(total_amount), 0) AS val FROM quotes WHERE status != 'rejected'")
+        quotes_count = quotes_rows[0]["n"] if quotes_rows else 0
+        quotes_val = quotes_rows[0]["val"] if quotes_rows else 0
+
+        # Inventory stats
+        inv_rows = await query_db("SELECT count(*) AS n FROM inventory")
+        inv_count = inv_rows[0]["n"] if inv_rows else 0
+
+        # Hot leads count
+        hot_rows = await query_db("SELECT count(*) AS n FROM prospects WHERE status IN ('meeting', 'replied')")
+        hot_leads = hot_rows[0]["n"] if hot_rows else 0
+
+        # AI Draft Accuracy Scorecard (Graduation Gate >= 95%)
+        ai_accuracy = await state.get_ai_accuracy_stats(last_n=50)
+
+        # Timeframe filter calculation (today / week / month / all)
+        rng = (range or "all").lower()
+        date_clause_p = ""
+        date_clause_o = ""
+        date_clause_a = ""
+        date_clause_c = ""
+        rng_label = "Semua Waktu"
+        if rng == "today":
+            date_clause_p = "WHERE date(created_at, '+7 hours') = date('now', '+7 hours')"
+            date_clause_o = "AND date(sent_at, '+7 hours') = date('now', '+7 hours')"
+            date_clause_a = "AND date(created_at, '+7 hours') = date('now', '+7 hours')"
+            date_clause_c = "WHERE date(updated_at, '+7 hours') = date('now', '+7 hours')"
+            rng_label = "Hari Ini"
+        elif rng == "week":
+            date_clause_p = "WHERE date(created_at, '+7 hours') >= date('now', '+7 hours', '-7 days')"
+            date_clause_o = "AND date(sent_at, '+7 hours') >= date('now', '+7 hours', '-7 days')"
+            date_clause_a = "AND date(created_at, '+7 hours') >= date('now', '+7 hours', '-7 days')"
+            date_clause_c = "WHERE date(updated_at, '+7 hours') >= date('now', '+7 hours', '-7 days')"
+            rng_label = "7 Hari Terakhir"
+        elif rng == "month":
+            date_clause_p = "WHERE date(created_at, '+7 hours') >= date('now', '+7 hours', '-30 days')"
+            date_clause_o = "AND date(sent_at, '+7 hours') >= date('now', '+7 hours', '-30 days')"
+            date_clause_a = "AND date(created_at, '+7 hours') >= date('now', '+7 hours', '-30 days')"
+            date_clause_c = "WHERE date(updated_at, '+7 hours') >= date('now', '+7 hours', '-30 days')"
+            rng_label = "30 Hari Terakhir"
+
+        r_contacts = (await query_db(f"SELECT count(*) AS n FROM prospects {date_clause_p}"))[0]["n"]
+        r_contacts_wa = (await query_db(f"SELECT count(*) AS n FROM prospects {date_clause_p + (' AND ' if date_clause_p else 'WHERE ')} phone IS NOT NULL AND trim(phone) != ''"))[0]["n"]
+        r_emails = (await query_db(f"SELECT count(*) AS n FROM outbox WHERE status = 'sent' AND provider != 'whatsapp' {date_clause_o}"))[0]["n"]
+        r_wa = (await query_db(f"SELECT count(*) AS n FROM actions WHERE action_type IN ('whatsapp_sent', 'whatsapp_reply_sent', 'whatsapp_followup') {date_clause_a}"))[0]["n"]
+        r_convos = (await query_db(f"SELECT count(*) AS n FROM conversations {date_clause_c}"))[0]["n"]
+
+        top_closing_quotes = await query_db(
+            """SELECT id, company, contact_name, phone, total_amount, status, stage, last_followup_at,
+                      ROUND(total_amount * CASE WHEN status = 'replied' THEN 0.85 ELSE 0.45 END, 0) AS weighted_value
+               FROM quotes
+               WHERE status NOT IN ('closed_won', 'won', 'lost', 'cancelled')
+                 AND lower(coalesce(company,'')) NOT LIKE '%fiwa%'
+                 AND coalesce(notes,'') NOT LIKE '%MANUAL_OPERATOR%'
+               ORDER BY weighted_value DESC LIMIT 5"""
+        )
+        visit_candidates = await query_db(
+            """SELECT p.id, p.first_name, p.company, p.phone, p.status,
+                      CASE
+                        WHEN lower(coalesce(p.company,'')) LIKE '%karawang%' OR lower(coalesce(p.company,'')) LIKE '%kiic%' THEN 'Karawang/KIIC'
+                        WHEN lower(coalesce(p.company,'')) LIKE '%cikarang%' OR lower(coalesce(p.company,'')) LIKE '%bekasi%' THEN 'Bekasi/Cikarang'
+                        WHEN lower(coalesce(p.company,'')) LIKE '%bogor%' THEN 'Bogor'
+                        ELSE 'Jabodetabek'
+                      END AS area
+               FROM prospects p
+               WHERE coalesce(p.phone,'') LIKE '628%'
+                 AND p.status NOT IN ('opted_out', 'lost')
+                 AND coalesce(p.personalization_notes,'') NOT LIKE '%[REFERRED_TO_PIC%'
+                 AND (
+                   lower(coalesce(p.company,'')) LIKE '%karawang%'
+                   OR lower(coalesce(p.company,'')) LIKE '%kiic%'
+                   OR lower(coalesce(p.company,'')) LIKE '%cikarang%'
+                   OR lower(coalesce(p.company,'')) LIKE '%bekasi%'
+                   OR lower(coalesce(p.company,'')) LIKE '%bogor%'
+                 )
+               ORDER BY CASE WHEN p.status = 'replied' THEN 0 ELSE 1 END, p.updated_at DESC
+               LIMIT 8"""
+        )
+
+        won_row = await query_db("SELECT coalesce(sum(total_amount), 0) AS total, count(*) AS n FROM quotes WHERE status IN ('closed_won', 'won')")
+        sprint_won_idr = float(won_row[0]["total"] or 0) if won_row else 0.0
+        sprint_target_idr = 200_000_000.0
+        urgent_inaproc = await query_db(
+            """SELECT id, package_name, institution, hps_budget, deadline, source_url
+               FROM inaproc_bids
+               WHERE status = 'discovered' AND deadline LIKE '%Nov 2026%'
+               ORDER BY coalesce(hps_budget, 0) DESC LIMIT 5"""
+        )
+
         stats = {
+            "range": rng,
+            "range_label": rng_label,
+            "range_contacts": r_contacts,
+            "range_contacts_wa": r_contacts_wa,
+            "range_emails": r_emails,
+            "range_wa": r_wa,
+            "range_conversations": r_convos,
             "companies": n_companies,
             "prospects": sum(counts.values()),
             "signals_confirmed": len(confirmed),
@@ -1948,6 +3588,23 @@ async def get_today():
             "signals_proposed": len(proposed),
             "email_provider": _current_provider(),
             "unprofiled": unprofiled_count,
+            "whatsapp_sent_today": wa_today,
+            "whatsapp_sent_total": wa_total,
+            "prospects_with_phone": prospects_with_phone,
+            "quotes_count": quotes_count,
+            "quotes_pipeline_value": quotes_val,
+            "inventory_skus": inv_count,
+            "hot_leads": hot_leads,
+            "ai_accuracy": ai_accuracy,
+            "top_closing_quotes": top_closing_quotes,
+            "visit_candidates": visit_candidates,
+            "sprint_200m": {
+                "target_idr": sprint_target_idr,
+                "won_idr": sprint_won_idr,
+                "remaining_idr": max(0.0, sprint_target_idr - sprint_won_idr),
+                "pct": round(min(100.0, (sprint_won_idr / sprint_target_idr) * 100.0), 1),
+            },
+            "urgent_inaproc": urgent_inaproc,
         }
 
         # Ordered by how much it blocks Harvey from doing anything at all.
@@ -2119,15 +3776,14 @@ CATEGORY_ORDER = ["discovery", "profile", "people", "verification"]
 @app.get("/api/signals")
 async def get_signals():
     """The signal vocabulary, grouped for review, with live cohort sizes."""
+    global _TODAY_INITIALIZED
     try:
-        from harvey.signals import seed_signal_catalog
-
         state = _state()
-        await state.init_db()
-        # Seeding is idempotent and never overrides a decision the user made,
-        # so it is safe to run on every load — new signals shipped in an
-        # upgrade show up as `proposed` without any migration step.
-        await seed_signal_catalog(state)
+        if not _TODAY_INITIALIZED:
+            from harvey.signals import seed_signal_catalog
+            await state.init_db()
+            await seed_signal_catalog(state)
+            _TODAY_INITIALIZED = True
 
         codes = await state.get_signal_codes()
         counts = {c["signal_code"]: c for c in await state.signal_counts()}
@@ -2358,6 +4014,17 @@ async def export_cohort(require: str = "", exclude: str = "", ranges: str = ""):
     )
 
 
+@app.get("/api/guidelines")
+async def get_guidelines_api():
+    """Return Parlant-style behavioral guidelines for PT Andis Sentral Laboratorium."""
+    try:
+        from harvey.guidelines import GuidelineEngine
+        engine = GuidelineEngine()
+        return [g.__dict__ for g in engine.list_guidelines(enabled_only=False)]
+    except Exception as e:
+        return [{"error": str(e)}]
+
+
 @app.get("/api/runs")
 async def get_runs_api():
     """The collector run log — what ran, when, what it produced and cost."""
@@ -2425,48 +4092,209 @@ class DashboardSetupError(Exception):
     """The dashboard can't start safely; the message says what to do."""
 
 
-def _check_loopback_bind(host: str) -> str:
-    """The host to bind, which must be a loopback address. The dashboard has
-    no remote-access mode: from another machine, use an SSH tunnel."""
+def get_local_ip() -> str:
+    """Detect local machine IP on LAN."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("8.8.8.8", 80))
+            return s.getsockname()[0]
+    except Exception:
+        return "127.0.0.1"
+
+
+def _check_loopback_bind(host: str, allow_remote: bool = False) -> str:
+    """The host to bind. Must be a loopback address unless allow_remote is True."""
     name = (host or "").strip().lower()
     if name.startswith("[") and name.endswith("]"):
         name = name[1:-1]
+    if allow_remote:
+        return name or "0.0.0.0"
     if not auth.is_loopback(name):
         raise DashboardSetupError(
             f"Refusing to listen on {host!r}: the dashboard only listens on this machine "
-            "(127.0.0.1, ::1 or localhost). To reach it from elsewhere, tunnel instead: "
-            "ssh -L 5555:127.0.0.1:5555 <this-host>")
+            "(127.0.0.1, ::1 or localhost). To reach it from elsewhere, use --allow-remote or --tunnel.")
     return name
 
 
-def dashboard_url(host: str = "127.0.0.1", port: int = 5555) -> str:
+def dashboard_url(host: str = "127.0.0.1", port: int = 5555, allow_remote: bool = False) -> str:
     """The unlock link. The token rides in the #fragment, which browsers
     never send to the server (so it stays out of logs and Referer); the
     page moves it to sessionStorage and strips it from the address bar."""
-    name = _check_loopback_bind(host)
+    name = _check_loopback_bind(host, allow_remote=allow_remote)
+    display_host = name
+    if display_host in ("0.0.0.0", "::") or (allow_remote and display_host == "127.0.0.1"):
+        display_host = get_local_ip()
     try:
-        if ipaddress.ip_address(name).version == 6:
-            name = f"[{name}]"
+        if ipaddress.ip_address(display_host).version == 6:
+            display_host = f"[{display_host}]"
     except ValueError:
         pass
-    return f"http://{name}:{port}/#token={token_store.get()}"
+    return f"http://{display_host}:{port}/#token={token_store.get()}"
 
 
-def start_dashboard(host: str = "127.0.0.1", port: int = 5555):
-    """Start the dashboard server (loopback only, token required)."""
+def start_cloudflared_tunnel(port: int = 5555, timeout: int = 20) -> tuple[subprocess.Popen, str]:
+    """Start cloudflared quick tunnel to expose dashboard publicly over HTTPS."""
+    binary_path = PROJECT_ROOT / "data" / "cloudflared.exe" if os.name == "nt" else PROJECT_ROOT / "data" / "cloudflared"
+    if not binary_path.exists():
+        import shutil
+        sys_cf = shutil.which("cloudflared")
+        if sys_cf:
+            binary_path = Path(sys_cf)
+        else:
+            raise DashboardSetupError(
+                f"cloudflared binary not found at {binary_path}. Please download it or install cloudflared."
+            )
+
+    cmd = [str(binary_path), "tunnel", "--url", f"http://127.0.0.1:{port}"]
+    log_file = PROJECT_ROOT / "data" / "cloudflared.log"
+    log_fp = open(log_file, "w+", encoding="utf-8")
+    proc = subprocess.Popen(
+        cmd,
+        stdout=log_fp,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+
+    tunnel_url = None
+    start_t = time.time()
+    url_pattern = re.compile(r"https://(?!api\.)[a-zA-Z0-9-]+\.trycloudflare\.com")
+
+    while time.time() - start_t < timeout:
+        log_fp.seek(0)
+        content = log_fp.read()
+        match = url_pattern.search(content)
+        if match:
+            tunnel_url = match.group(0)
+            break
+        if proc.poll() is not None:
+            break
+        time.sleep(0.5)
+
+    if not tunnel_url:
+        proc.terminate()
+        raise DashboardSetupError("Cloudflare tunnel failed to establish or report public URL within timeout.")
+
+    return proc, tunnel_url
+
+
+def start_dashboard(
+    host: str = "127.0.0.1",
+    port: int = 5555,
+    allow_remote: bool = False,
+    tunnel: bool = False,
+    send_wa: bool = False,
+    wa_phone: str = "087764021131",
+    open_browser: bool = True,
+):
+    """Start the dashboard server with optional remote LAN access and Cloudflare tunnel."""
     import uvicorn
 
+    if allow_remote or tunnel:
+        auth.DashboardGuard.ALLOW_REMOTE = True
+
+    tunnel_proc = None
+    tunnel_link = None
+    lan_link = None
+
+    if tunnel:
+        print("\n  Starting encrypted Cloudflare Tunnel for secure remote mobile access...")
+        try:
+            tunnel_proc, tunnel_base = start_cloudflared_tunnel(port=port)
+            tunnel_link = f"{tunnel_base}/#token={token_store.get()}"
+        except Exception as e:
+            print(f"  Warning: Cloudflare tunnel could not start: {e}")
+
     try:
-        bind = _check_loopback_bind(host)
-        url = dashboard_url(host, port)
+        bind_host = host
+        if allow_remote and host == "127.0.0.1":
+            bind_host = "0.0.0.0"
+
+        bind = _check_loopback_bind(bind_host, allow_remote=(allow_remote or tunnel))
+        local_url = dashboard_url(host, port, allow_remote=allow_remote)
+        lan_ip = get_local_ip()
+        lan_link = f"http://{lan_ip}:{port}/#token={token_store.get()}"
     except (DashboardSetupError, auth.TokenError) as e:
+        if tunnel_proc:
+            tunnel_proc.terminate()
         raise DashboardSetupError(str(e)) from e
 
-    print(f"\n  Harvey Dashboard running. Open this link to unlock it:\n\n    {url}\n")
-    print(f"  The token is stored in {token_store.path} (owner-only). Keep the link")
-    print("  private; anyone with it can use the dashboard. Press Ctrl+C to stop.\n")
-    if os.name == "nt":
-        print("  Windows: the token file is protected by your folder's permissions,")
-        print("  not POSIX file modes.\n")
-    uvicorn.run(app, host=bind, port=port, log_level="warning",
-                proxy_headers=False, server_header=False, date_header=False)
+    urls_info = {
+        "local": local_url,
+        "lan": lan_link if (allow_remote or bind_host == "0.0.0.0") else None,
+        "tunnel": tunnel_link,
+        "active": tunnel_link or (lan_link if (allow_remote or bind_host == "0.0.0.0") else local_url),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    try:
+        if "PYTEST_CURRENT_TEST" not in os.environ:
+            URLS_FILE.parent.mkdir(parents=True, exist_ok=True)
+            URLS_FILE.write_text(json.dumps(urls_info, indent=2), encoding="utf-8")
+    except Exception as e:
+        logger.warning(f"Failed to write dashboard-urls.json: {e}")
+
+    print(f"\n  ===============================================================", flush=True)
+    print(f"  Harvey Dashboard Siap Digunakan!", flush=True)
+    print(f"  ===============================================================", flush=True)
+    print(f"  🖥️  Komputer Lokal (Browser PC):", flush=True)
+    print(f"      {local_url}\n", flush=True)
+
+    if allow_remote or bind_host == "0.0.0.0":
+        print(f"  📶  HP Mobile / Satu Wi-Fi (LAN):", flush=True)
+        print(f"      {lan_link}\n", flush=True)
+
+    if tunnel_link:
+        print(f"  📱  HP Mobile Jarak Jauh (Global HTTPS Cloudflare):", flush=True)
+        print(f"      {tunnel_link}\n", flush=True)
+
+    print(f"  The token is stored in {token_store.path} (owner-only). Keep the link", flush=True)
+    print("  private; anyone with it can use the dashboard. Press Ctrl+C to stop.\n", flush=True)
+
+    if open_browser and "PYTEST_CURRENT_TEST" not in os.environ:
+        import threading
+        import webbrowser
+
+        def _open_browser_bg():
+            time.sleep(1.2)
+            try:
+                webbrowser.open(local_url)
+            except Exception:
+                pass
+
+        browser_thread = threading.Thread(target=_open_browser_bg, daemon=True)
+        browser_thread.start()
+
+    if send_wa:
+        import threading
+
+        def _dispatch_wa_bg():
+            time.sleep(1.0)
+            try:
+                from harvey.integrations.whatsapp import send_dashboard_link_to_wa
+                active_url = tunnel_link or lan_link or local_url
+                print(f"  Mengirimkan link dashboard ke WhatsApp {wa_phone}...", flush=True)
+                sent = asyncio.run(send_dashboard_link_to_wa(
+                    url=active_url,
+                    lan_url=lan_link if active_url != lan_link else None,
+                    target_phone=wa_phone,
+                ))
+                if sent:
+                    print(f"  Notifikasi WhatsApp berhasil terkirim ke {wa_phone}!", flush=True)
+                else:
+                    print(f"  Pengiriman ke WhatsApp gagal / profile belum siap.", flush=True)
+            except Exception as e:
+                print(f"  Gagal mengirim WA: {e}", flush=True)
+
+        wa_thread = threading.Thread(target=_dispatch_wa_bg, daemon=True)
+        wa_thread.start()
+
+    try:
+        uvicorn.run(app, host=bind, port=port, log_level="warning",
+                    proxy_headers=False, server_header=False, date_header=False)
+    finally:
+        if tunnel_proc:
+            print("\n  Stopping Cloudflare tunnel...")
+            tunnel_proc.terminate()
+            try:
+                tunnel_proc.wait(timeout=3)
+            except Exception:
+                pass

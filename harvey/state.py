@@ -519,6 +519,91 @@ MIGRATIONS: list[str] = [
     """
     ALTER TABLE usage_log ADD COLUMN gemini_calls INTEGER DEFAULT 0;
     """,
+    # ── v16: INAPROC & Mini Kompetisi bids and submissions ──
+    """
+    CREATE TABLE IF NOT EXISTS inaproc_bids (
+        id TEXT PRIMARY KEY,
+        package_name TEXT NOT NULL,
+        institution TEXT NOT NULL,
+        hps_budget REAL DEFAULT 0.0,
+        item_requirements_json TEXT DEFAULT '[]',
+        matched_inventory_id TEXT DEFAULT '',
+        matched_product_name TEXT DEFAULT '',
+        cost_hpp REAL DEFAULT 0.0,
+        target_price REAL DEFAULT 0.0,
+        margin_pct REAL DEFAULT 0.0,
+        status TEXT DEFAULT 'discovered',
+        source_url TEXT DEFAULT '',
+        deadline TEXT DEFAULT '',
+        notes TEXT DEFAULT '',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        submitted_at TIMESTAMP
+    );
+    CREATE INDEX IF NOT EXISTS idx_inaproc_bids_status ON inaproc_bids(status);
+    """,
+    # ── v17: Sourcing requests, vendors directory, and vendor quotes (Price Memory) ──
+    """
+    CREATE TABLE IF NOT EXISTS vendors (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        tier TEXT DEFAULT 'general',
+        categories_json TEXT DEFAULT '[]',
+        contact_name TEXT DEFAULT '',
+        phone TEXT DEFAULT '',
+        email TEXT DEFAULT '',
+        website TEXT DEFAULT '',
+        city TEXT DEFAULT '',
+        is_partner INTEGER DEFAULT 0,
+        is_blocked INTEGER DEFAULT 0,
+        notes TEXT DEFAULT '',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE INDEX IF NOT EXISTS idx_vendors_tier ON vendors(tier);
+    CREATE INDEX IF NOT EXISTS idx_vendors_partner ON vendors(is_partner);
+
+    CREATE TABLE IF NOT EXISTS sourcing_requests (
+        id TEXT PRIMARY KEY,
+        prospect_id TEXT DEFAULT '',
+        raw_query TEXT DEFAULT '',
+        clean_query TEXT NOT NULL,
+        normalized_specs TEXT DEFAULT '',
+        brand TEXT DEFAULT '',
+        model TEXT DEFAULT '',
+        qty INTEGER DEFAULT 1,
+        target_price REAL DEFAULT 0.0,
+        selected_hpp REAL DEFAULT 0.0,
+        selected_vendor_id TEXT DEFAULT '',
+        quoted_price REAL DEFAULT 0.0,
+        margin_pct REAL DEFAULT 0.0,
+        status TEXT DEFAULT 'pending',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE INDEX IF NOT EXISTS idx_sourcing_status ON sourcing_requests(status);
+    CREATE INDEX IF NOT EXISTS idx_sourcing_clean_query ON sourcing_requests(clean_query);
+
+    CREATE TABLE IF NOT EXISTS vendor_quotes (
+        id TEXT PRIMARY KEY,
+        sourcing_id TEXT REFERENCES sourcing_requests(id),
+        vendor_id TEXT DEFAULT '',
+        vendor_name TEXT NOT NULL,
+        brand TEXT DEFAULT '',
+        model TEXT DEFAULT '',
+        specs TEXT DEFAULT '',
+        unit_price_idr REAL DEFAULT 0.0,
+        ppn_included INTEGER DEFAULT 1,
+        landed_cost_idr REAL DEFAULT 0.0,
+        stock_status TEXT DEFAULT 'ready',
+        lead_time_days TEXT DEFAULT '',
+        warranty_months INTEGER DEFAULT 12,
+        source_url TEXT DEFAULT '',
+        score REAL DEFAULT 0.0,
+        notes TEXT DEFAULT '',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE INDEX IF NOT EXISTS idx_vendor_quotes_sourcing ON vendor_quotes(sourcing_id);
+    CREATE INDEX IF NOT EXISTS idx_vendor_quotes_name ON vendor_quotes(vendor_name);
+    """,
 ]
 
 BRAIN_PROVIDERS = ("claude", "codex", "gemini")
@@ -753,6 +838,8 @@ class StateManager:
     @staticmethod
     def _prospect_from_row(row: aiosqlite.Row) -> Prospect:
         d = dict(row)
+        if not d.get("id"):
+            d["id"] = _new_id()
         d["email_verified"] = bool(d.get("email_verified", 0))
         d["phone_verified"] = bool(d.get("phone_verified", 0))
         d["email_status"] = d.get("email_status") or ""
@@ -1874,6 +1961,21 @@ class StateManager:
             )
             await db.commit()
 
+    async def update_company_phone(self, company_id: str, phone: str):
+        """Update a company's phone number and propagate to any prospect without phone."""
+        if not phone:
+            return
+        async with self._connect() as db:
+            await db.execute(
+                "UPDATE companies SET phone = ? WHERE id = ? AND (phone IS NULL OR phone = '')",
+                (phone, company_id),
+            )
+            await db.execute(
+                "UPDATE prospects SET phone = ? WHERE company_id = ? AND (phone IS NULL OR phone = '')",
+                (phone, company_id),
+            )
+            await db.commit()
+
     async def rename_company(self, company_id: str, name: str):
         """Set a company's name, and the copy each of its prospects carries."""
         async with self._connect() as db:
@@ -1920,6 +2022,46 @@ class StateManager:
                 (f"-{int(stale_days)} days", int(limit)),
             ) as cursor:
                 return [dict(r) for r in await cursor.fetchall()]
+
+    async def companies_needing_domain(
+        self, limit: int = 10, stale_days: int = 14
+    ) -> list[dict]:
+        """Companies without a domain (e.g. from OpenStreetMap / CSV imports)
+        that haven't been checked recently."""
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                """SELECT c.id, c.name, c.domain, c.industry
+                   FROM companies c
+                   LEFT JOIN prospects p ON p.company_id = c.id
+                   WHERE (c.domain IS NULL OR c.domain = '')
+                     AND c.name != ''
+                     AND (c.prospects_checked_at IS NULL
+                          OR c.prospects_checked_at < datetime('now', ?))
+                   GROUP BY c.id
+                   HAVING COUNT(p.id) = 0
+                   ORDER BY c.prospects_checked_at IS NOT NULL, c.prospects_checked_at
+                   LIMIT ?""",
+                (f"-{int(stale_days)} days", int(limit)),
+            ) as cursor:
+                return [dict(r) for r in await cursor.fetchall()]
+
+    async def set_company_domain(self, company_id: str, domain: str, website: str = "") -> bool:
+        """Assign a discovered domain to a company if no other company owns it."""
+        domain = _norm(domain)
+        if not domain:
+            return False
+        async with self._connect() as db:
+            async with db.execute("SELECT id FROM companies WHERE domain = ?", (domain,)) as cur:
+                if await cur.fetchone():
+                    return False
+            await db.execute(
+                """UPDATE companies SET domain = ?, website = ?, updated_at = CURRENT_TIMESTAMP
+                   WHERE id = ?""",
+                (domain, website or f"https://{domain}", company_id),
+            )
+            await db.commit()
+            return True
 
     async def mark_prospects_checked(self, company_id: str):
         """Record that a prospect-backfill pass looked at this company,
@@ -2568,9 +2710,13 @@ class StateManager:
                 draft_campaigns = row[0] or 0
                 active_campaigns = row[1] or 0
             async with db.execute(
-                "SELECT COUNT(*) FROM conversations WHERE status = 'open'"
+                "SELECT COUNT(*) FROM conversations WHERE status = 'open' AND channel = 'email'"
             ) as cursor:
                 open_conversations = (await cursor.fetchone())[0]
+            async with db.execute(
+                "SELECT COUNT(*) FROM conversations WHERE status = 'open' AND channel = 'whatsapp'"
+            ) as cursor:
+                open_wa_conversations = (await cursor.fetchone())[0]
             async with db.execute(
                 "SELECT claude_calls, codex_calls, gemini_calls FROM usage_log WHERE date = ?", (today,)
             ) as cursor:
@@ -2591,6 +2737,7 @@ class StateManager:
             "draft_campaigns": draft_campaigns,
             "active_campaigns": active_campaigns,
             "open_conversations": open_conversations,
+            "open_whatsapp_conversations": open_wa_conversations,
             "usage_today": usage_today,  # Claude calls (kept for compatibility)
             "usage_today_by_provider": {
                 "claude": usage_today,
@@ -2602,4 +2749,472 @@ class StateManager:
             # Claude budget the rest of the loop is rationing.
             "unprofiled": await self.count_companies_needing_profile(),
         }
+
+    # ── INAPROC & Mini Kompetisi Bids ──
+
+    async def record_inaproc_bid(self, bid: dict) -> None:
+        """Insert or replace an INAPROC Mini Kompetisi bid entry."""
+        sql = """
+            INSERT INTO inaproc_bids (
+                id, package_name, institution, hps_budget, item_requirements_json,
+                matched_inventory_id, matched_product_name, cost_hpp, target_price,
+                margin_pct, status, source_url, deadline, notes, submitted_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                package_name = excluded.package_name,
+                institution = excluded.institution,
+                hps_budget = excluded.hps_budget,
+                matched_inventory_id = excluded.matched_inventory_id,
+                matched_product_name = excluded.matched_product_name,
+                cost_hpp = excluded.cost_hpp,
+                target_price = excluded.target_price,
+                margin_pct = excluded.margin_pct,
+                status = excluded.status,
+                source_url = excluded.source_url,
+                deadline = excluded.deadline,
+                notes = excluded.notes,
+                submitted_at = COALESCE(excluded.submitted_at, inaproc_bids.submitted_at)
+        """
+        req_json = json.dumps(bid.get("item_requirements", []), ensure_ascii=False) if isinstance(bid.get("item_requirements"), list) else bid.get("item_requirements_json", "[]")
+        params = (
+            str(bid["id"]),
+            str(bid.get("package_name", "")),
+            str(bid.get("institution", "")),
+            float(bid.get("hps_budget", 0.0)),
+            req_json,
+            str(bid.get("matched_inventory_id", "")),
+            str(bid.get("matched_product_name", "")),
+            float(bid.get("cost_hpp", 0.0)),
+            float(bid.get("target_price", 0.0)),
+            float(bid.get("margin_pct", 0.0)),
+            str(bid.get("status", "discovered")),
+            str(bid.get("source_url", "")),
+            str(bid.get("deadline", "")),
+            str(bid.get("notes", "")),
+            bid.get("submitted_at"),
+        )
+        async with self._connect() as db:
+            await db.execute(sql, params)
+            await db.commit()
+
+    async def get_inaproc_bids(self, status: str | None = None) -> list[dict]:
+        """Fetch INAPROC bids, optionally filtered by status."""
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            if status:
+                sql = "SELECT * FROM inaproc_bids WHERE status = ? ORDER BY created_at DESC"
+                params = (status,)
+            else:
+                sql = "SELECT * FROM inaproc_bids ORDER BY created_at DESC"
+                params = ()
+            async with db.execute(sql, params) as cursor:
+                rows = await cursor.fetchall()
+                return [dict(r) for r in rows]
+
+    async def update_inaproc_bid_status(
+        self,
+        bid_id: str,
+        status: str,
+        notes: str = "",
+        submitted_at: str | None = None,
+    ) -> None:
+        """Update status and submission timestamp of an INAPROC bid."""
+        sql = """
+            UPDATE inaproc_bids
+            SET status = ?,
+                notes = CASE WHEN ? != '' THEN ? ELSE notes END,
+                submitted_at = COALESCE(?, submitted_at)
+            WHERE id = ?
+        """
+        async with self._connect() as db:
+            await db.execute(sql, (status, notes, notes, submitted_at, bid_id))
+            await db.commit()
+
+    # ── Vendors & Sourcing Requests (Price Memory Bank) ──
+
+    async def seed_default_vendors_if_empty(self) -> int:
+        """Seed verified laboratory suppliers, prioritising official partners like PT CMSI."""
+        default_vendors = [
+            {
+                "id": "v_cmsi_partner",
+                "name": "PT Cahayatiara Mustika Scientific Indonesia (CMSI)",
+                "tier": "partner",
+                "categories": ["glassware", "reagents", "chemicals", "iwaki", "merck"],
+                "contact_name": "Divisi Kerjasama B2B",
+                "phone": "021-89830000",
+                "email": "sales@cmsi-id.com",
+                "website": "https://www.cmsi-id.com",
+                "city": "Cikarang / Bekasi",
+                "is_partner": 1,
+                "notes": "Mitra Kerjasama Prioritas Utama untuk Glassware Iwaki dan Reagen Kimia Merck.",
+            },
+            {
+                "id": "v_saka_principal",
+                "name": "PT Sumber Aneka Karya Abadi (SAKA)",
+                "tier": "principal",
+                "categories": ["oven", "incubator", "waterbath", "memmert", "climate chamber"],
+                "contact_name": "Sales Lab",
+                "website": "https://saka.co.id",
+                "city": "Jakarta",
+                "is_partner": 0,
+                "notes": "Distributor resmi Memmert Jerman di Indonesia.",
+            },
+            {
+                "id": "v_wira_duta_principal",
+                "name": "PT Wira Duta Intersains",
+                "tier": "principal",
+                "categories": ["analytical balance", "timbangan analitik", "moisture analyzer", "ohaus", "ph meter"],
+                "website": "https://wiradutaintersains.co.id",
+                "city": "Jakarta",
+                "is_partner": 0,
+                "notes": "Distributor resmi Ohaus Corporation di Indonesia.",
+            },
+            {
+                "id": "v_ribora_principal",
+                "name": "PT Ribora Sukses Abadi",
+                "tier": "principal",
+                "categories": ["biobase", "joanlab", "dlab", "autoclave", "centrifuge", "bsc", "fume hood"],
+                "website": "https://riborasuksesabadi.com",
+                "city": "Bekasi / Jakarta",
+                "is_partner": 0,
+                "notes": "Distributor brand ekonomis handal (Biobase, Joanlab, DLAB).",
+            },
+            {
+                "id": "v_ibs_principal",
+                "name": "PT Infiniti Bioanalitika Solusindo (IBS)",
+                "tier": "principal",
+                "categories": ["micropipette", "eppendorf", "centrifuge", "pcr", "thermal cycler"],
+                "website": "https://ibs.co.id",
+                "city": "Jakarta",
+                "is_partner": 0,
+                "notes": "Distributor resmi Eppendorf di Indonesia.",
+            },
+            {
+                "id": "v_andaru_principal",
+                "name": "PT Andaru Analitika Sains",
+                "tier": "principal",
+                "categories": ["scilogex", "homogenizer", "magnetic stirrer", "rotary evaporator"],
+                "website": "https://analitika.co.id",
+                "city": "Bogor",
+                "is_partner": 0,
+                "notes": "Distributor Scilogex & instrumen analitik, dekat Gudang AndisLab Bogor.",
+            },
+            {
+                "id": "v_monotaro_marketplace",
+                "name": "Monotaro Indonesia",
+                "tier": "marketplace",
+                "categories": ["general lab", "glassware", "consumables", "mro", "iwaki", "duran"],
+                "website": "https://www.monotaro.id",
+                "city": "Jakarta / Cikarang",
+                "is_partner": 0,
+                "notes": "Marketplace B2B resmi dengan transparansi harga publik dan termin tempo PT.",
+            },
+            {
+                "id": "v_labmart_marketplace",
+                "name": "LabMart Indonesia",
+                "tier": "marketplace",
+                "categories": ["instruments", "ika", "biobase", "ohaus", "chemicals", "general lab"],
+                "website": "https://www.labmart.id",
+                "city": "Jakarta",
+                "is_partner": 0,
+                "notes": "Distributor & marketplace lab B2B dengan kelengkapan faktur pajak dan garansi resmi.",
+            },
+            {
+                "id": "v_telagasakti_principal",
+                "name": "PT Telagasakti Sakatautama",
+                "tier": "principal",
+                "categories": ["merck", "glassware", "plasticware", "reagents", "test kit"],
+                "website": "https://telagasakti.co.id",
+                "city": "Jakarta",
+                "is_partner": 0,
+                "notes": "Supplier bahan kimia reagen Merck dan perlengkapan lab sejak 1993.",
+            },
+            {
+                "id": "v_dexatama_competitor",
+                "name": "PT Dexatama Niaga Labtekindo",
+                "tier": "general_competitor",
+                "categories": ["general lab", "centrifuge", "spectrophotometer", "e-katalog"],
+                "website": "https://dexatama.co.id",
+                "city": "Jakarta",
+                "is_partner": 0,
+                "notes": "Distributor & kompetitor e-katalog. Berlaku protokol Blind Procurement (Franco Bogor).",
+            },
+            {
+                "id": "v_abs_competitor",
+                "name": "PT Andalan Bangun Sejahtera (ABS)",
+                "tier": "general_competitor",
+                "categories": ["hettich", "centrifuge", "memmert", "general lab"],
+                "website": "https://pt-abs.com",
+                "city": "Jakarta Pusat",
+                "is_partner": 0,
+                "notes": "Penyedia umum Hettich/Memmert. Berlaku protokol Blind Procurement (Franco Bogor).",
+            },
+        ]
+
+        inserted = 0
+        async with self._connect() as db:
+            cur = await db.execute("SELECT COUNT(*) FROM vendors")
+            count = (await cur.fetchone())[0]
+            if count == 0:
+                for v in default_vendors:
+                    await db.execute(
+                        """INSERT OR IGNORE INTO vendors
+                           (id, name, tier, categories_json, contact_name, phone, email, website, city, is_partner, notes)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            v["id"], v["name"], v["tier"], json.dumps(v["categories"]),
+                            v.get("contact_name", ""), v.get("phone", ""), v.get("email", ""),
+                            v.get("website", ""), v.get("city", ""), v.get("is_partner", 0),
+                            v.get("notes", "")
+                        )
+                    )
+                    inserted += 1
+                await db.commit()
+        return inserted
+
+    async def get_vendors(self, category: str = "", only_partners: bool = False) -> list[dict]:
+        """Fetch list of active vendors filtered by category or partnership status."""
+        await self.seed_default_vendors_if_empty()
+        sql = "SELECT * FROM vendors WHERE is_blocked = 0"
+        params = []
+        if only_partners:
+            sql += " AND is_partner = 1"
+        if category:
+            sql += " AND (categories_json LIKE ? OR name LIKE ?)"
+            params.extend([f"%{category}%", f"%{category}%"])
+        sql += " ORDER BY is_partner DESC, tier ASC, name ASC"
+
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(sql, tuple(params)) as cursor:
+                rows = await cursor.fetchall()
+                out = []
+                for r in rows:
+                    d = dict(r)
+                    try:
+                        d["categories"] = json.loads(d.get("categories_json") or "[]")
+                    except Exception:
+                        d["categories"] = []
+                    out.append(d)
+                return out
+
+    async def create_sourcing_request(self, data: dict) -> str:
+        """Create a new sourcing inquiry ticket."""
+        req_id = data.get("id") or f"SRC-{datetime.now(timezone.utc).strftime('%Y%m')}-{uuid.uuid4().hex[:6].upper()}"
+        now_iso = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
+        sql = """
+            INSERT INTO sourcing_requests
+            (id, prospect_id, raw_query, clean_query, normalized_specs, brand, model, qty,
+             target_price, selected_hpp, selected_vendor_id, quoted_price, margin_pct, status, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """
+        async with self._connect() as db:
+            await db.execute(sql, (
+                req_id,
+                data.get("prospect_id", ""),
+                data.get("raw_query", ""),
+                data.get("clean_query", ""),
+                data.get("normalized_specs", ""),
+                data.get("brand", ""),
+                data.get("model", ""),
+                int(data.get("qty", 1) or 1),
+                float(data.get("target_price", 0.0) or 0.0),
+                float(data.get("selected_hpp", 0.0) or 0.0),
+                data.get("selected_vendor_id", ""),
+                float(data.get("quoted_price", 0.0) or 0.0),
+                float(data.get("margin_pct", 0.0) or 0.0),
+                data.get("status", "pending"),
+                now_iso,
+                now_iso
+            ))
+            await db.commit()
+        return req_id
+
+    async def update_sourcing_request(self, request_id: str, **kwargs) -> None:
+        """Update sourcing request details."""
+        if not kwargs:
+            return
+        now_iso = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
+        kwargs["updated_at"] = now_iso
+        cols = []
+        vals = []
+        for k, v in kwargs.items():
+            cols.append(f"{k} = ?")
+            vals.append(v)
+        vals.append(request_id)
+        sql = f"UPDATE sourcing_requests SET {', '.join(cols)} WHERE id = ?"
+        async with self._connect() as db:
+            await db.execute(sql, tuple(vals))
+            await db.commit()
+
+    async def get_sourcing_request(self, request_id: str) -> dict | None:
+        """Fetch a single sourcing request by ID."""
+        sql = "SELECT * FROM sourcing_requests WHERE id = ?"
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(sql, (request_id,)) as cursor:
+                row = await cursor.fetchone()
+                return dict(row) if row else None
+
+    async def add_vendor_quote(self, data: dict) -> str:
+        """Add a discovered vendor quote to Price Memory."""
+        quote_id = data.get("id") or f"VQ-{uuid.uuid4().hex[:10]}"
+        now_iso = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
+        sql = """
+            INSERT INTO vendor_quotes
+            (id, sourcing_id, vendor_id, vendor_name, brand, model, specs, unit_price_idr,
+             ppn_included, landed_cost_idr, stock_status, lead_time_days, warranty_months,
+             source_url, score, notes, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """
+        async with self._connect() as db:
+            await db.execute(sql, (
+                quote_id,
+                data.get("sourcing_id", ""),
+                data.get("vendor_id", ""),
+                data.get("vendor_name", ""),
+                data.get("brand", ""),
+                data.get("model", ""),
+                data.get("specs", ""),
+                float(data.get("unit_price_idr", 0.0) or 0.0),
+                1 if data.get("ppn_included", True) else 0,
+                float(data.get("landed_cost_idr", 0.0) or 0.0),
+                data.get("stock_status", "ready"),
+                data.get("lead_time_days", "7-14 hari"),
+                int(data.get("warranty_months", 12) or 12),
+                data.get("source_url", ""),
+                float(data.get("score", 0.0) or 0.0),
+                data.get("notes", ""),
+                now_iso
+            ))
+            await db.commit()
+        return quote_id
+
+    async def get_vendor_quotes_for_sourcing(self, sourcing_id: str) -> list[dict]:
+        """Fetch all vendor quotes linked to a sourcing request."""
+        sql = "SELECT * FROM vendor_quotes WHERE sourcing_id = ? ORDER BY landed_cost_idr ASC, score DESC"
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(sql, (sourcing_id,)) as cursor:
+                rows = await cursor.fetchall()
+                return [dict(r) for r in rows]
+
+    async def find_cached_price_memory(self, clean_query: str, max_days: int = 30) -> list[dict]:
+        """Look up historic quotes for similar items from Price Memory Bank within max_days."""
+        terms = [t for t in clean_query.lower().split() if len(t) > 2]
+        if not terms:
+            return []
+        
+        # Match primary keywords
+        like_clauses = " AND ".join(["(vq.specs LIKE ? OR vq.model LIKE ? OR sr.clean_query LIKE ?)" for _ in terms[:3]])
+        params = []
+        for t in terms[:3]:
+            params.extend([f"%{t}%", f"%{t}%", f"%{t}%"])
+        
+        sql = f"""
+            SELECT vq.*, sr.clean_query as original_query
+            FROM vendor_quotes vq
+            JOIN sourcing_requests sr ON vq.sourcing_id = sr.id
+            WHERE {like_clauses}
+              AND date(vq.created_at) >= date('now', '-{max_days} days')
+              AND vq.landed_cost_idr > 0
+            ORDER BY vq.landed_cost_idr ASC
+            LIMIT 10
+        """
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(sql, tuple(params)) as cursor:
+                rows = await cursor.fetchall()
+                return [dict(r) for r in rows]
+
+    # ── Operator Feedback Learning Loop & AI Graduation Scorecard ──
+
+    async def log_operator_feedback(
+        self,
+        *,
+        outbox_id: str,
+        prospect_id: str = "",
+        ai_draft: str,
+        operator_action: str,
+        final_text: str = "",
+    ) -> None:
+        """Record OK / REVISI / BATAL decisions for AI accuracy tracking & few-shot learning."""
+        async with self._connect() as db:
+            await db.execute(
+                """CREATE TABLE IF NOT EXISTS operator_feedback_log (
+                       id TEXT PRIMARY KEY,
+                       outbox_id TEXT,
+                       prospect_id TEXT,
+                       ai_draft TEXT,
+                       operator_action TEXT,
+                       final_text TEXT,
+                       created_at TEXT DEFAULT CURRENT_TIMESTAMP
+                   )"""
+            )
+            await db.execute(
+                """INSERT INTO operator_feedback_log
+                       (id, outbox_id, prospect_id, ai_draft, operator_action, final_text, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (_new_id(), outbox_id, prospect_id, ai_draft, operator_action.upper(), final_text, _utcnow().isoformat()),
+            )
+            await db.commit()
+
+    async def get_ai_accuracy_stats(self, last_n: int = 50) -> dict:
+        """Compute approval rate across the last N reviewed drafts (Graduation Gate >= 95%)."""
+        async with self._connect() as db:
+            await db.execute(
+                """CREATE TABLE IF NOT EXISTS operator_feedback_log (
+                       id TEXT PRIMARY KEY,
+                       outbox_id TEXT,
+                       prospect_id TEXT,
+                       ai_draft TEXT,
+                       operator_action TEXT,
+                       final_text TEXT,
+                       created_at TEXT DEFAULT CURRENT_TIMESTAMP
+                   )"""
+            )
+            async with db.execute(
+                "SELECT operator_action FROM operator_feedback_log ORDER BY created_at DESC LIMIT ?",
+                (int(last_n),),
+            ) as cursor:
+                rows = await cursor.fetchall()
+        total = len(rows)
+        ok_count = sum(1 for (act,) in rows if (act or "").upper() == "OK")
+        rev_count = sum(1 for (act,) in rows if (act or "").upper() == "REVISI")
+        batal_count = sum(1 for (act,) in rows if (act or "").upper() == "BATAL")
+        rate = round((ok_count / total) * 100.0, 1) if total > 0 else 0.0
+        return {
+            "total_reviewed": total,
+            "ok": ok_count,
+            "revisi": rev_count,
+            "batal": batal_count,
+            "accuracy_pct": rate,
+            "graduated": total >= 50 and rate >= 95.0,
+        }
+
+    async def get_recent_adaptations(self, limit: int = 5) -> list[dict]:
+        """Mahoraga Adaptation Wheel: fetch recent REVISI lessons from operator_feedback_log."""
+        async with self._connect() as db:
+            await db.execute(
+                """CREATE TABLE IF NOT EXISTS operator_feedback_log (
+                       id TEXT PRIMARY KEY,
+                       outbox_id TEXT,
+                       prospect_id TEXT,
+                       ai_draft TEXT,
+                       operator_action TEXT,
+                       final_text TEXT,
+                       created_at TEXT DEFAULT CURRENT_TIMESTAMP
+                   )"""
+            )
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                """SELECT ai_draft, final_text, created_at
+                   FROM operator_feedback_log
+                   WHERE operator_action = 'REVISI' AND trim(final_text) != ''
+                   ORDER BY created_at DESC LIMIT ?""",
+                (int(limit),),
+            ) as cursor:
+                rows = await cursor.fetchall()
+                return [dict(r) for r in rows]
+
 

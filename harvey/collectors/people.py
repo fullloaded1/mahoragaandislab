@@ -707,9 +707,10 @@ def find_people(pages: list[tuple[str, str]], domain: str, site_name: str = "") 
 
 _LINK_WEIGHTS = (
     (3, r"team|meet|leadership|staff|people|doctors?|dentists?|attorneys?|"
-        r"lawyers?|physicians?|providers?|owners?|founders?|principals?|partners|who-?we-?are|bios?"),
-    (2, r"about|story|history|company|firm|practice|family"),
-    (1, r"contact"),
+        r"lawyers?|physicians?|providers?|owners?|founders?|principals?|partners|who-?we-?are|bios?|"
+        r"manajemen|direksi|pengurus|pimpinan|struktur-?organisasi|tim-?kami"),
+    (2, r"about|story|history|company|firm|practice|family|tentang|tentang-?kami|profil|sejarah"),
+    (1, r"contact|hubungi|hubungi-?kami|kontak|kontak-?kami"),
 )
 # A keyword counts in a whole path segment ("/our-team/", "/attorneys/",
 # "/meet-the-dentists.html") or a short menu label ("Meet the Team") — not
@@ -793,7 +794,7 @@ _AT_DOT = re.compile(
 _KNOWN_TLDS = frozenset("""
 com net org edu gov io co us biz info me ca uk au nz ie de fr es it nl be ch at se no dk fi
 pl pt mx br in ai app dev law legal dental agency marketing design studio tech solutions
-services company group pro health care clinic roofing law
+services company group pro health care clinic roofing law id sg my th vn ph hk jp kr tw cn
 """.split())
 # Recognised obfuscation schemes only: a mailto-ish element carrying a local
 # part and a domain (data-user/data-domain; data-front/data-back, as WordPress

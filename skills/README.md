@@ -22,6 +22,8 @@ When an agent runs, it calls `brain.load_skills_for_agent("agent_name")` which c
 | `product_knowledge.md` | x | x | x | x | x |
 | `competitive_intel.md` | | x | x | | |
 | `selling_to_startups.md` | | x* | x* | | |
+| `referral_playbook.md` | | | x | | |
+| `humanizer.md` | | x | x | | x |
 
 \* Only for prospects whose company is a startup by its own site's account (the `YC_BACKED` or `ACCELERATOR` signal, or a `FUNDING_ROUND` from the last 18 months), not loaded for everyone.
 
@@ -36,6 +38,8 @@ When an agent runs, it calls `brain.load_skills_for_agent("agent_name")` which c
 - **`sales_methodology.md`** — ABC Loop, conversation flow, tone calibration, ethical guidelines
 - **`offer_strategy.md`** — Offer ladder by engagement level, closing mechanics, timing rules
 - **`objection_handling.md`** — LAARC framework, 4 objection categories with responses
+- **`humanizer.md`** — Anti-AI writing rules (removes Not-X-but-Y, staged openers, one-line closers, forced triads, stock AI buzzwords, and unnatural formatting)
+- **`referral_playbook.md`** — Consultative referral requests for B2B lab procurement: post-BAST timing, permission-based introductions, and strict anti-gratification compliance for public institutions
 - **`linkedin_outreach.md`** — Connection sequences, messaging templates, rate limits
 
 ## Auto-Generated Skills

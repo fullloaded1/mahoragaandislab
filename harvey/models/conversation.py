@@ -12,9 +12,16 @@ def _utcnow() -> datetime:
 
 
 class Message(BaseModel):
-    sender: str  # "harvey" or "prospect"
-    content: str
+    sender: str = "prospect"  # "harvey", "prospect", or "operator"
+    content: str = ""
     timestamp: datetime = Field(default_factory=_utcnow)
+
+    def __init__(self, **data):
+        if "text" in data and not data.get("content"):
+            data["content"] = data["text"]
+        if "content" in data and not data.get("text"):
+            data["text"] = data["content"]
+        super().__init__(**data)
 
 
 # Sales stages: tracks where the deal is in the pipeline

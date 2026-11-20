@@ -9,6 +9,7 @@ Steps 2-3 stay campaign-level (proof point + breakup are less personal by
 design). Every draft still passes the deterministic pre-send gate.
 """
 
+import asyncio
 import json
 import logging
 import re
@@ -82,6 +83,18 @@ class Writer:
         prospects_with_email = [
             p for p in prospects_with_email
             if not await self.state.colleague_who_replied(p.id)
+        ]
+        # Partner / excluded companies are never targeted for cold outreach
+        from harvey.config import is_partner_or_excluded
+        prospects_with_email = [
+            p for p in prospects_with_email
+            if not is_partner_or_excluded(
+                name=f"{p.first_name} {p.last_name}",
+                company=p.company,
+                email=p.email,
+                phone=p.phone or "",
+                config=self.config,
+            )
         ]
         if not prospects_with_email:
             logger.info(
@@ -201,15 +214,19 @@ class Writer:
         now = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
         provider = self.config.channels.email.provider
 
-        pending = []
-        for prospect in prospects:
-            try:
-                draft = await self._write_personal_email(prospect)
-            except Exception as e:
-                logger.warning(f"Writer: personal draft failed for {prospect.email}: {e}")
-                continue
-            if draft:
-                pending.append((prospect, draft))
+        sem = asyncio.Semaphore(4)
+
+        async def _draft_one(prospect):
+            async with sem:
+                try:
+                    draft = await self._write_personal_email(prospect)
+                    return (prospect, draft) if draft else None
+                except Exception as e:
+                    logger.warning(f"Writer: personal draft failed for {prospect.email}: {e}")
+                    return None
+
+        results = await asyncio.gather(*(_draft_one(p) for p in prospects))
+        pending = [r for r in results if r is not None]
 
         # One Humanizer pass over the whole batch before anything is staged.
         polished = await humanize(
@@ -257,17 +274,26 @@ class Writer:
             notes = await self.state.get_writing_feedback(prospect_ids)
         except Exception as e:
             logger.warning(f"Writer: could not read feedback: {e}")
-            return ""
-        if not notes:
+            notes = []
+
+        adapt_lines = []
+        try:
+            adaptations = await self.state.get_recent_adaptations(limit=5)
+            for ad in adaptations:
+                adapt_lines.append(f"- Operator prefers: {' '.join(str(ad.get('final_text') or '').split())[:220]}")
+        except Exception:
+            pass
+
+        if not notes and not adapt_lines:
             return ""
         lines = "\n".join(
             f"- {str(n.get('created_at') or '')[:10]} on {n['about']}: "
             f"{' '.join(str(n['comment']).split())[:500]}" for n in notes)
+        combined = "\n".join(x for x in (lines, "\n".join(adapt_lines)) if x)
         return (
-            "\n\nOWNER FEEDBACK — notes the person running Harvey left on earlier\n"
-            "campaigns and contacts, newest first (a newer note wins). Apply them to\n"
-            "this writing. They never override the STRICT EMAIL RULES or the FACTS rule:\n"
-            + lines
+            "\n\nOWNER FEEDBACK & MAHORAGA ADAPTATION — notes and revisions the operator made on earlier\n"
+            "campaigns and drafts, newest first. Apply their tone and accuracy rules to this writing:\n"
+            + combined
         )
 
     async def _write_personal_email(self, prospect) -> dict | None:
@@ -279,9 +305,10 @@ class Writer:
                 f"- Company: {prospect.company}",
             ]
             inbox_rule = (
-                "\n- This goes to the company's general inbox, most likely read by the owner"
-                "\n  or the office manager. Use no first name; open with 'Hi there' or"
-                "\n  address the company's team.")
+                "\n- This goes to the company's general inbox, most likely read by the procurement team,"
+                "\n  laboratory manager, or office manager. Use formal respectful Indonesian greeting:"
+                "\n  'Yth. Bapak/Ibu Tim Pengadaan & Kepala Laboratorium {prospect.company}' or"
+                "\n  'Selamat pagi Bapak/Ibu Tim {prospect.company}'. NEVER use 'Hi there' or English greetings.")
         else:
             facts = [
                 f"- Name: {prospect.full_name()}",
@@ -325,6 +352,13 @@ class Writer:
         ) or ""
         if self.skills:
             prompt += "\n\n" + self.skills
+        try:
+            from harvey.paths import PROJECT_ROOT
+            pb_path = PROJECT_ROOT / "skills" / "mahoraga_agency_sales.md"
+            if pb_path.exists():
+                prompt += "\n\nMAHORAGA AGENCY SALES PLAYBOOK:\n" + pb_path.read_text(encoding="utf-8")[:1200]
+        except Exception:
+            pass
         if startup is not None:
             prompt += self._startup_playbook()
         prompt += await self._feedback_block([prospect.id])
@@ -374,15 +408,17 @@ Return ONLY JSON: {{"subject": "...", "body": "..."}}"""
         inbox_batch = all(p.is_company_inbox for p in prospects)
         if inbox_batch:
             merge_rule = (
-                "- These go to each company's general inbox, so no names are known.\n"
+                "- These go to each company's general inbox, so no individual names are known.\n"
                 "  Use {{company}} as the merge variable in every email and NEVER\n"
-                "  {{first_name}} or {{title}}. Greet with 'Hi there' or the company's team."
+                "  {{first_name}} or {{title}}. Greet with formal Indonesian address: 'Yth. Bapak/Ibu Tim Pengadaan & Kepala Laboratorium {{company}}'\n"
+                "  or 'Selamat pagi Bapak/Ibu Tim {{company}}'. NEVER use 'Hi there'."
             )
         else:
             merge_rule = (
                 "- Use {{first_name}}, {{company}}, {{title}} as merge variables — every email\n"
                 "  must use at least one, and email 1 must reference something specific to\n"
-                "  these prospects' industry or role (use the notes above)."
+                "  these prospects' industry or role (use the notes above).\n"
+                "  Greet with respectful Indonesian address: 'Yth. Bapak/Ibu {{first_name}}' or 'Selamat pagi Bapak/Ibu {{first_name}}'."
             )
 
         prompt = self.brain.load_prompt(

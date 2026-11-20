@@ -74,7 +74,11 @@ MAX_SITE_PAGES = 6
 # Every request Scout makes for one company — homepage variants, menu pages,
 # inbox pages, the check that a second domain is theirs — shares this cap.
 MAX_SITE_FETCHES = 10
-FALLBACK_SITE_PATHS = ("/about", "/about-us", "/team", "/our-team", "/contact", "/contact-us")
+FALLBACK_SITE_PATHS = (
+    "/about", "/about-us", "/team", "/our-team", "/contact", "/contact-us",
+    "/hubungi-kami", "/kontak", "/tentang-kami", "/tentang", "/id/contact",
+    "/id/hubungi-kami", "/id/tentang-kami",
+)
 # Named decision makers taken from one company per visit, likeliest first.
 MAX_CONTACTS_PER_COMPANY = 2
 # With no evidence of a company's email format, guess first@ only when
@@ -89,10 +93,15 @@ LOCAL_BUSINESS_SOURCES = ("discover:osm", "discover:dataforseo_listings")
 # only mailboxes it will use, most likely read by the owner first. An
 # allowlist, not a blocklist: a personal address (jane.doe@) on a contact
 # page is a person Harvey chose not to target, never "the team".
-INBOX_PAGES = ("/contact", "/contact-us")
+INBOX_PAGES = (
+    "/contact", "/contact-us", "/hubungi-kami", "/kontak",
+    "/id/contact", "/id/hubungi-kami", "/tentang-kami",
+)
 INBOX_PREFERRED = ("owner", "office", "info", "contact", "contactus", "hello",
-                   "team", "service", "sales", "estimates", "quotes",
-                   "inquiries", "enquiries", "admin", "support")
+                   "team", "service", "sales", "marketing", "cs", "customercare",
+                   "customerservice", "inquiry", "inquiries", "enquiries",
+                   "procurement", "purchasing", "admin", "support", "sekretariat",
+                   "humas")
 MAX_PROSPECTS_PER_CYCLE = 25
 
 # Hunter domain-searches per heartbeat. The monthly budget itself is shared
@@ -363,14 +372,18 @@ class Scout:
         if self._queries_this_cycle > 1:
             await asyncio.sleep(random.uniform(*SEARCH_DELAY))
 
+        tavily_key = getattr(self.env, "tavily_api_key", "") or ""
         serper_key = getattr(self.env, "serper_api_key", "") or ""
         backends = []
+        if tavily_key:
+            backends.append(lambda: self._search_tavily(query, tavily_key))
         if serper_key:
             backends.append(lambda: self._search_serper(query, serper_key))
         backends.extend([
-            lambda: self._search_duckduckgo(query),
             lambda: self._search_bing(query),
+            lambda: self._search_duckduckgo(query),
             lambda: self._search_google(query),
+            lambda: self._search_yahoo(query),
         ])
 
         for backend in backends:
@@ -399,6 +412,35 @@ class Scout:
             seen.add(norm)
             out.append((url, snippet))
         return out
+
+    async def _search_tavily(self, query: str, api_key: str) -> list[tuple[str, str]]:
+        """Search via Tavily AI Search API — clean JSON, high-accuracy B2B results."""
+        resp = await self._fetch(
+            "https://api.tavily.com/search",
+            method="POST",
+            json_body={"api_key": api_key, "query": query, "max_results": MAX_RESULTS_PER_QUERY},
+            headers={"Content-Type": "application/json"},
+            retries=2,
+        )
+        if resp is None:
+            return []
+        try:
+            data = resp.json()
+        except (json.JSONDecodeError, ValueError) as e:
+            logger.debug(f"Tavily returned non-JSON: {e}")
+            return []
+        if not isinstance(data, dict):
+            return []
+
+        results = []
+        for item in data.get("results", []) or []:
+            if not isinstance(item, dict):
+                continue
+            url = item.get("url", "") or ""
+            snippet = item.get("content", "") or ""
+            if url:
+                results.append((url, snippet))
+        return results[:MAX_RESULTS_PER_QUERY]
 
     async def _search_serper(self, query: str, api_key: str) -> list[tuple[str, str]]:
         """Search via Serper.dev API — most reliable, $5/mo for 2.5k searches."""
@@ -515,6 +557,38 @@ class Scout:
 
         if results:
             logger.debug(f"Google returned {len(results)} results")
+        return results[:MAX_RESULTS_PER_QUERY]
+
+    async def _search_yahoo(self, query: str) -> list[tuple[str, str]]:
+        """Search via Yahoo HTML scraping — resilient fallback when DuckDuckGo returns 202."""
+        from urllib.parse import unquote
+        url = f"https://search.yahoo.com/search?p={quote_plus(query)}&n={MAX_RESULTS_PER_QUERY}"
+        resp = await self._fetch(url, retries=1)
+        if resp is None:
+            return []
+
+        soup = self._safe_soup(resp.text)
+        if soup is None:
+            return []
+
+        results = []
+        for div in soup.select("div.algo, div.Sr"):
+            link = div.select_one("a[href]")
+            snippet_el = div.select_one(".compText, p")
+            if not link:
+                continue
+            href = self._attr_str(link.get("href"))
+            if "/RU=" in href:
+                try:
+                    href = unquote(href.split("/RU=")[1].split("/RK=")[0])
+                except Exception:
+                    pass
+            snippet = snippet_el.get_text().strip() if snippet_el else ""
+            if href.startswith("http") and "yahoo.com" not in href:
+                results.append((href, snippet))
+
+        if results:
+            logger.debug(f"Yahoo returned {len(results)} results")
         return results[:MAX_RESULTS_PER_QUERY]
 
     # ── Strategy -1: Hunter named contacts (quota-gated) ──
@@ -638,7 +712,26 @@ class Scout:
             )
         except Exception as e:
             logger.debug(f"companies_needing_prospects failed: {e}")
-            return 0
+            companies = []
+
+        # Also resolve domains for companies discovered without a website (e.g., OSM / CSV)
+        if len(companies) < MAX_COMPANIES_PER_CYCLE:
+            try:
+                no_dom = await self.state.companies_needing_domain(
+                    limit=MAX_COMPANIES_PER_CYCLE - len(companies)
+                )
+            except Exception:
+                no_dom = []
+            for comp in no_dom:
+                guessed = await self._guess_domain(comp.get("name") or "")
+                if guessed and await self.state.set_company_domain(comp["id"], guessed):
+                    comp["domain"] = guessed
+                    companies.append(comp)
+                else:
+                    try:
+                        await self.state.mark_prospects_checked(comp["id"])
+                    except Exception:
+                        pass
 
         if not companies:
             return 0
@@ -784,17 +877,29 @@ class Scout:
         logger.info("Scout: Searching for LinkedIn profiles...")
         count = 0
 
-        geo = self.config.icp.geography[0] if self.config.icp.geography else ""
+        geo = self.config.icp.geography[0] if self.config.icp.geography else "Indonesia"
         industry = self.config.icp.industries[0] if self.config.icp.industries else ""
 
-        for title in self.config.icp.titles:
+        dual_pic_titles = list(self.config.icp.titles or []) + [
+            "Kepala Laboratorium", "QC Manager", "Purchasing Manager", "Procurement",
+        ]
+        # Deduplicate preserving order
+        seen_t = set()
+        target_titles = []
+        for t in dual_pic_titles:
+            if t and t.lower() not in seen_t:
+                seen_t.add(t.lower())
+                target_titles.append(t)
+
+        for title in target_titles:
             if self._queries_this_cycle >= MAX_QUERIES_PER_CYCLE:
                 break
 
-            query = f'site:linkedin.com/in "{title}"'
+            li_site = "site:id.linkedin.com/in" if "indonesia" in geo.lower() else "site:linkedin.com/in"
+            query = f'{li_site} "{title}"'
             if industry:
                 query += f' "{industry}"'
-            if geo:
+            if geo and "indonesia" not in li_site:
                 query += f' "{geo}"'
 
             results = await self._web_search(query)
@@ -806,15 +911,19 @@ class Scout:
                 parsed = self._parse_linkedin_url(url, snippet)
                 if not parsed:
                     continue
+                comp_name = (parsed.get("company") or "").strip()
+                if comp_name and not self._is_valid_indonesian_end_user(comp_name, url, snippet):
+                    continue
 
                 prospect = Prospect(
                     first_name=parsed.get("first_name", ""),
                     last_name=parsed.get("last_name", ""),
+                    company=comp_name,
                     linkedin_url=url,
-                    title=title,
-                    seniority=self._infer_seniority(title),
+                    title=parsed.get("title") or title,
+                    seniority=self._infer_seniority(parsed.get("title") or title),
                     industry=industry,
-                    source="web_search",
+                    source="linkedin_id_search",
                     source_url=url,
                 )
 
@@ -1096,27 +1205,36 @@ class Scout:
         return [d for d in domains if not (d in seen or seen.add(d))][:5]
 
     def _build_company_search_queries(self) -> list[str]:
-        """Build search queries to find ICP-matching companies."""
+        """Build search queries to find ICP-matching companies with natural B2B terms."""
         queries = []
         industries = self.config.icp.industries or [""]
         geos = self.config.icp.geography or [""]
-        size = self.config.icp.company_size or ""
 
-        for industry in industries[:2]:
-            geo = geos[0] if geos else ""
+        # Map ICP industries to natural Indonesian & English search phrases
+        id_map = {
+            "Laboratory & Research": "perusahaan laboratorium riset pengujian",
+            "Pharmaceutical & Medical": "perusahaan farmasi alat kesehatan",
+            "Hospital & Clinic": "rumah sakit klinik laboratorium",
+            "Manufacturing & Factory QC": "pabrik manufaktur quality control",
+            "University & Higher Education": "laboratorium universitas fakultas sains",
+        }
 
-            parts = []
-            if industry:
-                parts.append(f'"{industry}"')
-            if geo:
-                parts.append(f'"{geo}"')
-            if size:
-                parts.append(f'"{size}"')
-            parts.append("company")
-            queries.append(" ".join(parts))
+        import random
+        # Rotate across industries and geographies
+        shuffled_industries = list(industries)
+        shuffled_geos = list(geos)
+        random.shuffle(shuffled_industries)
+        random.shuffle(shuffled_geos)
 
-            if geo and industry:
-                queries.append(f'top "{industry}" companies {geo}')
+        for industry in shuffled_industries[:3]:
+            for geo in shuffled_geos[:2]:
+                clean_geo = geo.split(",")[0].strip() if geo else ""
+                local_term = id_map.get(industry, industry)
+                if clean_geo:
+                    queries.append(f"{local_term} {clean_geo}")
+                    queries.append(f"{industry} companies {clean_geo}")
+                else:
+                    queries.append(f"{local_term} indonesia")
 
         # Drop empties / dupes, cap to budget.
         seen = set()
@@ -1126,7 +1244,7 @@ class Scout:
             if q and q != "company" and q not in seen:
                 seen.add(q)
                 out.append(q)
-        return out[:3]
+        return out[:MAX_QUERIES_PER_CYCLE]
 
     async def _resolve_email(
         self, first_name: str, last_name: str, domain: str
@@ -1239,6 +1357,22 @@ Respond ONLY with the JSON array."""
         """Deterministic ICP fit score used as a fallback / baseline."""
         score = 40
 
+        # Reject / heavily penalize non-Indonesian or competitor contacts
+        if not self._is_valid_indonesian_end_user(contact.company, contact.email or "", contact.industry or ""):
+            return 5
+
+        # Complete Lead Dossier bonus: Real person name + job title + valid ID phone
+        fn_low = (contact.first_name or "").strip().lower()
+        is_generic = (
+            not fn_low
+            or fn_low.startswith(("tim ", "kontak ", "inbound", "general", "admin", "info"))
+            or fn_low == (contact.company or "").strip().lower()
+        )
+        if not is_generic:
+            score += 20
+        else:
+            score -= 25
+
         # Title / seniority fit.
         if self._title_matches_icp(contact.title):
             score += 25
@@ -1246,6 +1380,11 @@ Respond ONLY with the JSON array."""
             "c_suite": 20, "vp": 15, "director": 10, "manager": 5, "individual": 0,
         }
         score += seniority_bonus.get(contact.seniority, 0)
+
+        # Valid Indonesian mobile/WhatsApp bonus
+        ph = (contact.phone or "").strip()
+        if ph.startswith(("628", "08", "+628")) and 10 <= len(ph) <= 15:
+            score += 15
 
         # Industry fit.
         if contact.industry and self.config.icp.industries:
@@ -1331,8 +1470,33 @@ Respond ONLY with the JSON array."""
                 break
         return "", None
 
+    async def _fetch_js_rendered_html(self, url: str) -> str:
+        """Use Crawl4AI (with Playwright fallback) for modern JS/React/Next.js company websites."""
+        try:
+            from crawl4ai import AsyncWebCrawler
+            async with AsyncWebCrawler(verbose=False) as crawler:
+                res = await crawler.arun(url=url)
+                if res and getattr(res, "html", None):
+                    return res.html
+        except Exception as e:
+            logger.debug(f"Scout: Crawl4AI skipped for {url}, trying Playwright: {e}")
+
+        try:
+            from playwright.async_api import async_playwright
+            async with async_playwright() as p:
+                browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-gpu"])
+                page = await browser.new_page()
+                await page.goto(url, wait_until="domcontentloaded", timeout=15000)
+                await page.wait_for_timeout(1500)
+                html = await page.content()
+                await browser.close()
+                return html or ""
+        except Exception as e:
+            logger.debug(f"Scout: Playwright JS fallback skipped for {url}: {e}")
+            return ""
+
     async def _scrape_company_info(self, domain: str) -> dict:
-        """Scrape a company's homepage for basic info. Pure Python."""
+        """Scrape a company's homepage for basic info. Pure Python + Playwright JS fallback."""
         info = {"name": "", "description": "", "website": f"https://{domain}"}
 
         base, resp = await self._resolve_base_url(domain, retries=2)
@@ -1340,10 +1504,16 @@ Respond ONLY with the JSON array."""
             return info
         info["website"] = base
 
-        # Keep the raw HTML so signal detection reuses this fetch.
-        info["_homepage_html"] = resp.text
+        raw_html = resp.text
+        soup = self._safe_soup(raw_html)
+        if soup is not None and len(soup.get_text(" ", strip=True)) < 150:
+            js_html = await self._fetch_js_rendered_html(base)
+            if js_html:
+                raw_html = js_html
+                soup = self._safe_soup(raw_html)
 
-        soup = self._safe_soup(resp.text)
+        # Keep the raw HTML so signal detection reuses this fetch.
+        info["_homepage_html"] = raw_html
         if soup is None:
             return info
 
@@ -1587,8 +1757,10 @@ Respond ONLY with the JSON array."""
 
             first_name = member.get("first_name", "")
             last_name = member.get("last_name", "")
-            if not first_name or not last_name:
+            if not (first_name or last_name):
                 continue
+            if not first_name and last_name:
+                first_name, last_name = last_name, ""
             named_on_site = True
             if considered >= MAX_CONTACTS_PER_COMPANY:
                 break
@@ -1637,6 +1809,13 @@ Respond ONLY with the JSON array."""
             )
             if inbox:
                 contacts.append(inbox)
+                reachable = inbox.email_status in ("verified", "risky")
+            if not reachable and getattr(self.config.channels.email, "send_to_risky", False):
+                mx_inbox = await self._mx_role_fallback_prospect(
+                    company_id, domain, company_name, industry, signal_note,
+                )
+                if mx_inbox:
+                    contacts.append(mx_inbox)
         return contacts
 
     async def _observe_likely_owner(self, company_id: str, member: dict):
@@ -1711,6 +1890,40 @@ Respond ONLY with the JSON array."""
         logger.info(f"Scout: No named owner at {domain}; using its published inbox {email} [{status}]")
         return prospect
 
+    async def _mx_role_fallback_prospect(
+        self, company_id: str, domain: str, company_name: str,
+        industry: str, signal_note: str = "",
+    ) -> Prospect | None:
+        """When send_to_risky=True and an Indonesian/B2B site hides its email behind JS/forms,
+        check if the domain has a valid MX record and create a 'risky' role inbox (info@domain)."""
+        from harvey.integrations.email_finder import get_mx_host
+        clean_dom = self._host(domain)
+        if not clean_dom or clean_dom.endswith(".go.id"):
+            return None
+        mx_host = await get_mx_host(clean_dom)
+        if not mx_host:
+            return None
+        email = f"info@{clean_dom}"
+        prospect = Prospect(
+            first_name="Tim Pengadaan",
+            last_name=company_name[:30],
+            email=email,
+            email_status="risky",
+            email_verified=False,
+            company=company_name,
+            company_id=company_id,
+            title="Purchasing / General Inbox",
+            industry=industry,
+            source=COMPANY_INBOX_SOURCE,
+            source_url=f"https://{clean_dom}",
+            personalization_notes=signal_note,
+        )
+        if not prospect.is_valid() or await self._is_duplicate_prospect(prospect):
+            return None
+        self._remember_prospect(prospect)
+        logger.info(f"Scout: MX verified for {clean_dom} ({mx_host}); added role inbox {email} [risky]")
+        return prospect
+
     async def _find_inbox_address(self, domain: str) -> str:
         """Best general address published on the company's own pages.
 
@@ -1735,19 +1948,25 @@ Respond ONLY with the JSON array."""
                     pages.append((url, getattr(resp, "text", "") or ""))
 
         candidates = []
+        fallback_candidates = []
         for _, text in pages:
             for addr in people_mod.emails_on_page(text):
                 local, _, adomain = addr.partition("@")
-                if local not in INBOX_PREFERRED or addr in candidates:
-                    continue
                 adomain = adomain.removeprefix("www.")
                 if adomain != domain and not adomain.endswith("." + domain) \
                         and not await self._is_own_domain(adomain, site):
                     continue
-                candidates.append(addr)
-        if not candidates:
-            return ""
-        return min(candidates, key=lambda a: INBOX_PREFERRED.index(a.partition("@")[0]))
+                if local in INBOX_PREFERRED:
+                    if addr not in candidates:
+                        candidates.append(addr)
+                elif not any(bad in local for bad in ("noreply", "no-reply", "donotreply", "abuse", "postmaster", "webmaster")):
+                    if addr not in fallback_candidates:
+                        fallback_candidates.append(addr)
+        if candidates:
+            return min(candidates, key=lambda a: INBOX_PREFERRED.index(a.partition("@")[0]))
+        if fallback_candidates:
+            return fallback_candidates[0]
+        return ""
 
     async def _is_own_domain(self, other: str, site: dict) -> bool:
         """Is ``other`` the business's own second domain? True when its
@@ -1775,7 +1994,7 @@ Respond ONLY with the JSON array."""
         `pip install python-jobspy`); silently skipped otherwise.
         """
         try:
-            from jobspy import scrape_jobs
+            from jobspy import scrape_jobs  # type: ignore[import-not-found]
         except ImportError:
             logger.debug("Scout: python-jobspy not installed; skipping job boards.")
             return 0
@@ -1996,23 +2215,39 @@ Respond ONLY with the JSON array."""
         return []
 
     async def _guess_domain(self, company_name: str) -> str:
-        """Guess a company's domain from its name and confirm it resolves."""
-        name = company_name.lower().strip()
-        for suffix in [" inc", " llc", " ltd", " corp", " co", " group",
-                       " incorporated", " limited", " company"]:
-            if name.endswith(suffix):
-                name = name[: -len(suffix)]
-        name = re.sub(r"[^a-z0-9]", "", name)
-        if not name:
+        """Guess a company's domain from its name and confirm it resolves (DNS MX or HTTP)."""
+        from harvey.integrations.email_finder import get_mx_host
+        s = (company_name or "").lower().strip()
+        acronyms = re.findall(r"\(([a-z0-9]{3,12})\)", s)
+        s = re.sub(r"\([^)]*\)", " ", s)
+        s = re.sub(
+            r"\b(pt\.?|tbk\.?|cv\.?|ud\.?|persero|indonesia|indo|group|grup|utama|"
+            r"jaya|abadi|makmur|sentosa|sejahtera|inc|llc|ltd|corp|co|company|"
+            r"laboratorium|laboratory|lab|klinik|clinic|rumah|sakit|rs|rsud|"
+            r"universitas|institut|politeknik|fakultas|sekolah|tinggi)\b",
+            " ",
+            s,
+        )
+        words = [w for w in re.findall(r"[a-z0-9]+", s) if len(w) >= 2]
+        slugs = list(acronyms)
+        if words:
+            for cand in ("".join(words[:2]), "".join(words[:3]), words[0], "-".join(words[:2])):
+                if len(cand) >= 3 and cand not in slugs:
+                    slugs.append(cand)
+        if not slugs:
             return ""
 
-        for tld in (".com", ".io", ".co"):
-            domain = f"{name}{tld}"
-            resp = await self._fetch(
-                f"https://{domain}", method="HEAD", timeout=6, retries=1
-            )
-            if resp is not None and resp.status_code < 400:
-                return domain
+        for slug in slugs[:3]:
+            for tld in (".co.id", ".com", ".id", ".ac.id"):
+                domain = f"{slug}{tld}"
+                mx = await get_mx_host(domain)
+                if mx:
+                    return domain
+                resp = await self._fetch(
+                    f"https://{domain}", method="HEAD", timeout=4, retries=1
+                )
+                if resp is not None and resp.status_code < 400:
+                    return domain
         return ""
 
     def _extract_domain(self, url: str) -> str:
@@ -2034,7 +2269,7 @@ Respond ONLY with the JSON array."""
         return ""
 
     def _is_noise_domain(self, domain: str) -> bool:
-        """Filter out domains that aren't actual companies."""
+        """Filter out domains that aren't actual target companies (news, dicts, marketplaces, competitors)."""
         noise = {
             "linkedin.com", "facebook.com", "twitter.com", "x.com",
             "instagram.com", "youtube.com", "tiktok.com", "pinterest.com",
@@ -2049,10 +2284,43 @@ Respond ONLY with the JSON array."""
             "g2.com", "capterra.com", "clutch.co",
             "trustpilot.com", "getapp.com", "producthunt.com",
             "youtu.be", "goo.gl", "bit.ly", "t.co",
+            # Foreign news, dictionaries, reference & non-prospect sites
+            "wsj.com", "marketwatch.com", "vocabulary.com", "wordhippo.com",
+            "scribd.com", "streetdirectory.com", "sciencedaily.com", "oup.com",
+            "usembassy.gov", "britannica.com", "merriam-webster.com", "nytimes.com",
+            "forbes.com", "reuters.com", "bloomberg.com", "cnn.com", "bbc.com",
+            "nih.gov", "nature.com", "springer.com", "elsevier.com", "researchgate.net",
+            "fictish.com",
+            # Indonesian directories, marketplaces, job boards & partner exclusions
+            "indotrading.com", "ralali.com", "tokopedia.com", "shopee.co.id",
+            "bukalapak.com", "blibli.com", "lazada.co.id", "olx.co.id",
+            "jobstreet.co.id", "glints.com", "karir.com", "kalibrr.com", "loker.id",
         }
-        if domain in noise:
+        dom = (domain or "").lower().strip()
+        if dom in noise:
             return True
-        return any(domain == n or domain.endswith(f".{n}") for n in noise)
+        if any(dom == n or dom.endswith(f".{n}") for n in noise):
+            return True
+        # Reject fellow lab/alkes vendors & competitors by domain keywords
+        vendor_dom_keys = ("alkes", "medialab", "labtech-indonesia", "jualalatlab", "alatlab", "distributorobat")
+        return any(vk in dom for vk in vendor_dom_keys)
+
+    def _is_valid_indonesian_end_user(self, company_name: str, email_or_domain: str = "", extra_text: str = "") -> bool:
+        """Strict ICP Gate: ensure target is an Indonesian lab end-user, not a foreign news site or lab vendor."""
+        blob = f"{company_name or ''} {email_or_domain or ''} {extra_text or ''}".lower()
+        forbidden_keywords = (
+            "wall street", "wordhippo", "vocabulary", "scribd", "synonym", "embassy",
+            "marketwatch", "sciencedaily", "streetdirectory", "fictish",
+            "indotrading", "alkesindo", "medialab", "medlab", "distributor alat lab",
+            "supplier alat laboratorium", "jual alat lab", "distributorobat",
+            "loker ", "lowongan kerja",
+        )
+        if any(fk in blob for fk in forbidden_keywords):
+            return False
+        dom = email_or_domain.split("@")[-1] if "@" in email_or_domain else email_or_domain
+        if dom and self._is_noise_domain(dom):
+            return False
+        return True
 
     def _domain_to_name(self, domain: str) -> str:
         """Convert a domain to a rough company name."""

@@ -4,10 +4,10 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <meta name="referrer" content="no-referrer">
-<title>Harvey — Command Deck</title>
+<title>MAHORAGA — AndisLab Adaptive Revenue Engine</title>
 <!-- First, so the token leaves the address bar before anything else runs. -->
-<script src="/static/auth.js"></script>
-<link rel="stylesheet" href="/static/app.css">
+<script src="/static/auth.js?v=20261113b"></script>
+<link rel="stylesheet" href="/static/app.css?v=20261113b">
 </head>
 <body>
 
@@ -42,7 +42,7 @@
 
 <!-- Shown whenever the API refuses this tab (no token, a wrong one, or none on the server). -->
 <div id="lock-screen"
-     style="display:none;position:fixed;inset:0;z-index:1000;align-items:center;justify-content:center;padding:24px">
+     style="display:none;position:fixed;inset:0;z-index:1000;background:rgba(0,0,0,0.85);backdrop-filter:blur(6px);align-items:center;justify-content:center;padding:24px">
   <div class="card" style="max-width:500px;width:100%">
     <h2>Dashboard locked</h2>
     <p class="lede" id="lock-reason" role="alert"></p>
@@ -63,19 +63,26 @@
 
 <aside class="sidebar">
   <div class="brand">
-    <h1>Harvey</h1>
-    <div class="tagline">Always Be Closing</div>
+    <h1>MAHORAGA</h1>
+    <div class="tagline">Adaptive Sales Engine &middot; AndisLab</div>
   </div>
 
   <nav aria-label="Sections">
     <div class="nav-group">
       <div class="nav-label">Work</div>
-      <button class="active" onclick="showTab('today', this)"><svg class="icon" aria-hidden="true"><use href="#i-today"/></svg><span class="label">Today</span><span class="nav-count" id="nav-today"></span></button>
+      <button class="active" onclick="showTab('today', this)"><svg class="icon" aria-hidden="true"><use href="#i-today"/></svg><span class="label">Dashboard</span><span class="nav-count" id="nav-today"></span></button>
+      <button onclick="showTab('office', this)"><svg class="icon" aria-hidden="true"><use href="#i-companies"/></svg><span class="label">Kantor Agen</span></button>
       <button onclick="showTab('outbox', this)"><svg class="icon" aria-hidden="true"><use href="#i-outbox"/></svg><span class="label">Outbox</span><span class="nav-count" id="nav-outbox"></span></button>
       <button onclick="showTab('conversations', this)"><svg class="icon" aria-hidden="true"><use href="#i-conversations"/></svg><span class="label">Conversations</span><span class="nav-count" id="nav-conversations"></span></button>
+      <button onclick="showTab('quotes', this)"><svg class="icon" aria-hidden="true"><use href="#i-campaigns"/></svg><span class="label">Pipeline SPH</span><span class="nav-count" id="nav-quotes"></span></button>
+      <button onclick="showTab('forecast', this)"><svg class="icon" aria-hidden="true"><use href="#i-usage"/></svg><span class="label">Forecast &amp; Target</span></button>
+      <button onclick="showTab('bigdata', this)"><svg class="icon" aria-hidden="true"><use href="#i-signals"/></svg><span class="label">Big Data &amp; Analitik</span></button>
+      <button onclick="showTab('sourcing', this)"><svg class="icon" aria-hidden="true"><use href="#i-discover"/></svg><span class="label">Sourcing Barang</span></button>
     </div>
     <div class="nav-group">
       <div class="nav-label">Pipeline</div>
+      <button onclick="showTab('inaproc', this)"><svg class="icon" aria-hidden="true"><use href="#i-flag"/></svg><span class="label">Radar INAPROC</span><span class="nav-count" id="nav-inaproc"></span></button>
+      <button onclick="showTab('telephony', this)"><svg class="icon" aria-hidden="true"><use href="#i-message"/></svg><span class="label">Calling Desk &amp; Voice</span><span class="nav-count" id="nav-telephony"></span></button>
       <button onclick="showTab('signals', this)"><svg class="icon" aria-hidden="true"><use href="#i-signals"/></svg><span class="label">Signals</span><span class="nav-count" id="nav-signals"></span></button>
       <button onclick="showTab('discover', this)"><svg class="icon" aria-hidden="true"><use href="#i-discover"/></svg><span class="label">Discover</span></button>
       <button onclick="showTab('companies', this)"><svg class="icon" aria-hidden="true"><use href="#i-companies"/></svg><span class="label">Companies</span></button>
@@ -98,6 +105,8 @@
       <span id="header-status-text">Checking…</span>
     </div>
     <div class="foot-actions">
+      <button class="icon-btn" id="live-sync-btn" onclick="toggleLiveSync()"
+              title="Auto-refresh realtime setiap 12 detik (non-blocking)" style="color:var(--good)">LIVE 12s</button>
       <button class="icon-btn" id="theme-btn" onclick="cycleTheme()"
               title="Appearance: follows your system until you pick one">auto</button>
       <button class="refresh-btn" onclick="loadCurrentTab()" title="Refresh this page">
@@ -109,12 +118,82 @@
 <main class="content">
 <div class="content-inner">
 
-<!-- Today: what needs a human -->
-<div id="today" class="section active">
-  <div class="section-head">
+<!-- Sourcing Barang (Multi-Vendor Procurement Agent) -->
+<div id="sourcing" class="section">
+  <div class="section-head" style="flex-wrap:wrap;gap:12px">
     <div>
-      <h2>Today</h2>
-      <p>What's waiting on you, and how the pipeline is moving.</p>
+      <h2>Sourcing Barang &amp; Pembanding Vendor</h2>
+      <p>Cari supplier Indonesia (Gudang Internal + Tavily + Serper Google ID + INAPROC E-Katalog + Firecrawl), hitung HPP landed, margin, &amp; buat Blind RFQ.</p>
+    </div>
+  </div>
+  <div class="card" style="padding:16px;margin-bottom:16px">
+    <div style="margin-bottom:10px">
+      <label style="display:block;font-size:12px;color:var(--text-3);margin-bottom:6px">Tulis Permintaan Bebas (seperti ChatGPT / Gemini — tekan Enter untuk cari, Shift+Enter baris baru)</label>
+      <textarea id="src-query" rows="2" placeholder="contoh: Carikan 5 unit Chromebook Acer C733R include CDM, budget maksimal 4jt per unit, ready stock Jabodetabek" onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();runSourcingSearch();}" style="width:100%;padding:10px 12px;border-radius:10px;border:1px solid var(--border);background:var(--surface-2);color:var(--text);font-size:13px;resize:vertical"></textarea>
+    </div>
+    <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:end">
+      <div style="width:90px">
+        <label style="display:block;font-size:12px;color:var(--text-3);margin-bottom:4px">Qty (ops.)</label>
+        <input id="src-qty" type="number" min="1" placeholder="auto" style="width:100%;padding:8px 10px;border-radius:8px;border:1px solid var(--border);background:var(--surface-2);color:var(--text)">
+      </div>
+      <div style="width:110px">
+        <label style="display:block;font-size:12px;color:var(--text-3);margin-bottom:4px">Margin (%)</label>
+        <input id="src-margin" type="number" min="5" max="80" value="20" style="width:100%;padding:8px 10px;border-radius:8px;border:1px solid var(--border);background:var(--surface-2);color:var(--text)">
+      </div>
+      <div style="width:160px">
+        <label style="display:block;font-size:12px;color:var(--text-3);margin-bottom:4px">Budget/Unit (Rp, ops.)</label>
+        <input id="src-budget" type="number" min="0" placeholder="otomatis dari teks" style="width:100%;padding:8px 10px;border-radius:8px;border:1px solid var(--border);background:var(--surface-2);color:var(--text)">
+      </div>
+      <button id="src-run-btn" class="btn btn-primary" onclick="runSourcingSearch()" style="height:36px">Cari &amp; Bandingkan Vendor</button>
+    </div>
+    <div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:10px;align-items:center">
+      <span class="muted" style="font-size:11px">Contoh cepat:</span>
+      <button class="btn btn-ghost btn-sm" onclick="document.getElementById('src-query').value='Oven pengering laboratorium 50 liter Memmert';">Oven Lab 50L</button>
+      <button class="btn btn-ghost btn-sm" onclick="document.getElementById('src-query').value='Analytical Balance 0.1 mg Ohaus';">Analytical Balance 0.1mg</button>
+      <button class="btn btn-ghost btn-sm" onclick="document.getElementById('src-query').value='Centrifuge 4000 rpm 8x15ml';">Centrifuge 4000 rpm</button>
+      <button class="btn btn-ghost btn-sm" onclick="document.getElementById('src-query').value='Autoclave Sterilizer 24 Liter';">Autoclave 24L</button>
+    </div>
+  </div>
+  <div id="sourcing-result"></div>
+</div>
+
+<!-- Kantor Agen (Virtual Office Floor + Live Feed) -->
+<div id="office" class="section">
+  <div class="section-head" style="flex-wrap:wrap;gap:12px">
+    <div>
+      <h2>Kantor Agen MAHORAGA</h2>
+      <p>Visualisasi lantai kerja real-time seluruh agen AI Anda (Scout, Writer, Handler, Sender, INAPROC, Big Data).</p>
+    </div>
+    <button class="btn btn-ghost btn-sm" onclick="loadOffice()"><svg class="icon" aria-hidden="true"><use href="#i-refresh"/></svg>Refresh</button>
+  </div>
+  <div id="office-health" style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px"></div>
+  <div class="card" style="padding:12px;margin-bottom:16px;background:#0b0f17;border:1px solid var(--border);overflow:hidden">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;padding:0 4px;flex-wrap:wrap;gap:8px">
+      <div style="display:flex;align-items:center;gap:10px;font-size:12px;color:var(--text-2)">
+        <span style="display:inline-flex;align-items:center;gap:5px"><span style="width:8px;height:8px;border-radius:50%;background:#22c55e;display:inline-block"></span>Bekerja</span>
+        <span style="display:inline-flex;align-items:center;gap:5px"><span style="width:8px;height:8px;border-radius:50%;background:#f59e0b;display:inline-block"></span>Menunggu</span>
+        <span style="display:inline-flex;align-items:center;gap:5px"><span style="width:8px;height:8px;border-radius:50%;background:#64748b;display:inline-block"></span>Standby / Lounge</span>
+      </div>
+      <div id="office-selected-bar" style="font-size:12px;color:#38bdf8;font-family:var(--font-mono)">Klik meja agen di peta untuk lihat detail</div>
+    </div>
+    <canvas id="office-canvas" style="width:100%;height:390px;display:block;border-radius:10px;cursor:pointer;background:#0d121b"></canvas>
+  </div>
+  <div id="office-floor" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px;margin-bottom:16px"></div>
+  <div id="office-terminal" class="card" style="padding:16px"></div>
+</div>
+
+<!-- Dashboard Overview -->
+<div id="today" class="section active">
+  <div class="section-head" style="flex-wrap:wrap;gap:12px">
+    <div>
+      <h2>Ringkasan Dashboard</h2>
+      <p>Pantau prospek, penjangkauan WhatsApp/Email, pipeline SPH, dan akurasi AI secara bersih &amp; real-time.</p>
+    </div>
+    <div id="range-switcher" style="display:flex;gap:6px;background:var(--surface-2);padding:4px;border-radius:8px;border:1px solid var(--border)">
+      <button class="btn btn-sm" id="rng-today" onclick="setDashboardRange('today')">Hari Ini</button>
+      <button class="btn btn-sm" id="rng-week" onclick="setDashboardRange('week')">Minggu Ini (7H)</button>
+      <button class="btn btn-sm" id="rng-month" onclick="setDashboardRange('month')">30 Hari</button>
+      <button class="btn btn-sm btn-primary" id="rng-all" onclick="setDashboardRange('all')">Semua</button>
     </div>
   </div>
 
@@ -231,14 +310,93 @@
 
 <!-- Contacts -->
 <div id="prospects" class="section">
-  <div class="section-head">
-    <div><h2>Contacts</h2><p>People Harvey has found, how sure it is of their address, and where each one stands.</p></div>
-    <div class="page-actions">
-      <button class="btn btn-secondary btn-sm" onclick="downloadCsv('/api/export/prospects.csv', 'prospects.csv', this)"><svg class="icon" aria-hidden="true"><use href="#i-download"/></svg>Export deliverable</button>
-      <button class="btn btn-ghost btn-sm" onclick="downloadCsv('/api/export/prospects.csv?all=true', 'prospects-all.csv', this)">Export all</button>
+  <div class="section-head" style="flex-wrap:wrap;gap:12px">
+    <div><h2>Contacts</h2><p>Prospek &amp; kontak dipisahkan per hari (WIB) agar setiap hari selalu bersih dan terpisah dari kemarin.</p></div>
+    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+      <div id="contact-range-switcher" style="display:flex;gap:4px;background:var(--surface-2);padding:4px;border-radius:8px;border:1px solid var(--border)">
+        <button class="btn btn-sm btn-primary" id="crng-today" onclick="setContactRange('today')">Hari Ini</button>
+        <button class="btn btn-sm" id="crng-yesterday" onclick="setContactRange('yesterday')">Kemarin</button>
+        <button class="btn btn-sm" id="crng-week" onclick="setContactRange('week')">7 Hari</button>
+        <button class="btn btn-sm" id="crng-all" onclick="setContactRange('all')">Semua</button>
+      </div>
+      <div class="page-actions">
+        <button class="btn btn-primary btn-sm" onclick="const f=document.getElementById('add-prospect-form');f.style.display=f.style.display==='none'?'block':'none'">+ Tambah Kontak</button>
+        <button class="btn btn-secondary btn-sm" onclick="downloadCsv('/api/export/prospects.csv', 'prospects.csv', this)"><svg class="icon" aria-hidden="true"><use href="#i-download"/></svg>Export deliverable</button>
+        <button class="btn btn-ghost btn-sm" onclick="downloadCsv('/api/export/prospects.csv?all=true', 'prospects-all.csv', this)">Export all</button>
+      </div>
+    </div>
+  </div>
+  <div id="add-prospect-form" class="card" style="display:none;padding:14px;margin-bottom:14px">
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:10px;align-items:end">
+      <div><label class="form-label">Perusahaan / Instansi</label><input id="ap-company" class="form-input" placeholder="PT Contoh Lab"></div>
+      <div><label class="form-label">Nama PIC</label><input id="ap-name" class="form-input" placeholder="Ibu/Bapak ..."></div>
+      <div><label class="form-label">No. WhatsApp (628...)</label><input id="ap-phone" class="form-input" placeholder="0812..."></div>
+      <div><label class="form-label">Email</label><input id="ap-email" class="form-input" placeholder="pic@instansi.co.id"></div>
+      <div><label class="form-label">Jabatan</label><input id="ap-title" class="form-input" placeholder="QC / Purchasing"></div>
+      <div><button class="btn btn-primary btn-sm" onclick="addProspectManual()">Simpan Kontak</button></div>
     </div>
   </div>
   <div id="prospects-table"></div>
+</div>
+
+<!-- Forecast & Target Closing Command Center -->
+<div id="forecast" class="section">
+  <div class="section-head">
+    <div>
+      <h2>Forecast &amp; Target Closing</h2>
+      <p>Proyeksi omset realistis (Weighted Forecast), kalender target PO mingguan, serta progress &amp; kendala tiap SPH.</p>
+    </div>
+    <button class="btn btn-ghost btn-sm" onclick="loadForecast()"><svg class="icon" aria-hidden="true"><use href="#i-refresh"/></svg>Refresh</button>
+  </div>
+  <div id="forecast-kpis" class="kpis" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:12px;margin-bottom:18px"></div>
+  <div id="forecast-calendar" class="card" style="margin-bottom:18px;padding:16px"></div>
+  <div id="forecast-table-wrap" class="card" style="padding:16px;overflow-x:auto"></div>
+</div>
+
+<!-- Big Data Lake & Win/Loss Analytics -->
+<div id="bigdata" class="section">
+  <div class="section-head" style="flex-wrap:wrap;gap:12px">
+    <div>
+      <h2>Big Data Lake &amp; Analitik Win/Loss</h2>
+      <p>Memori vektor lokal (LanceDB), sebaran prospek 4 vertikal (Industri Swasta, RS/Klinik, Kampus, Pemerintah), serta pola Win/Loss &amp; alat terlaris.</p>
+    </div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap">
+      <button class="btn btn-ghost btn-sm" id="btn-rebuild-bigdata" onclick="rebuildBigDataIndex()">Sinkronkan Index LanceDB</button>
+      <button class="btn btn-primary btn-sm" id="btn-harvest-universe" onclick="runUniverseHarvest()">Panen Prospek 4 Segmen</button>
+    </div>
+  </div>
+  <div id="bigdata-kpis" class="kpis" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px;margin-bottom:18px"></div>
+  <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:16px;margin-bottom:18px">
+    <div id="bigdata-segments" class="card" style="padding:16px"></div>
+    <div id="bigdata-winloss" class="card" style="padding:16px"></div>
+  </div>
+  <div id="bigdata-equipment" class="card" style="padding:16px"></div>
+</div>
+
+<!-- Pipeline SPH (Kanban CRM) -->
+<div id="quotes" class="section">
+  <div class="section-head">
+    <div>
+      <h2>Pipeline SPH &mdash; Kanban CRM</h2>
+      <p>Pantau seluruh penawaran harga resmi (SPH), nilai potensi deal, dan pindahkan tahap closing secara real-time.</p>
+    </div>
+    <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+      <div id="quotes-summary-bar" style="font-size:13px;color:var(--text-2);font-weight:600"></div>
+      <button class="btn btn-primary btn-sm" onclick="const f=document.getElementById('add-quote-form');f.style.display=f.style.display==='none'?'block':'none'">+ Tambah SPH</button>
+    </div>
+  </div>
+  <div id="add-quote-form" class="card" style="display:none;padding:14px;margin-bottom:14px">
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:10px;align-items:end">
+      <div><label class="form-label">No. SPH</label><input id="aq-id" class="form-input" placeholder="QUO-050"></div>
+      <div><label class="form-label">Perusahaan / Instansi</label><input id="aq-company" class="form-input" placeholder="PT Contoh"></div>
+      <div><label class="form-label">Nama PIC</label><input id="aq-contact" class="form-input" placeholder="Bapak/Ibu ..."></div>
+      <div><label class="form-label">No. WA (628...)</label><input id="aq-phone" class="form-input" placeholder="0812..."></div>
+      <div><label class="form-label">Nilai (Rp)</label><input id="aq-amount" type="number" class="form-input" placeholder="50000000"></div>
+      <div><label class="form-label">Item Penawaran</label><input id="aq-items" class="form-input" placeholder="Oven 50L, Balance"></div>
+      <div><button class="btn btn-primary btn-sm" onclick="addQuoteManual()">Simpan SPH</button></div>
+    </div>
+  </div>
+  <div id="quotes-kanban" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:14px;align-items:start"></div>
 </div>
 
 <!-- Campaigns -->
@@ -257,6 +415,11 @@
     </div>
     <div class="page-actions" id="outbox-actions"></div>
   </div>
+  <div id="outbox-channel-tabs" style="display:flex;gap:6px;margin-bottom:14px;flex-wrap:wrap">
+    <button class="btn btn-sm btn-primary" id="ob-ch-all" onclick="setOutboxChannel('all')">Semua</button>
+    <button class="btn btn-sm" id="ob-ch-whatsapp" onclick="setOutboxChannel('whatsapp')">WhatsApp</button>
+    <button class="btn btn-sm" id="ob-ch-email" onclick="setOutboxChannel('email')">Email</button>
+  </div>
   <div id="outbox-banner"></div>
   <div id="outbox-desk"></div>
   <div id="outbox-list"></div>
@@ -264,13 +427,29 @@
 
 <!-- Conversations -->
 <div id="conversations" class="section">
-  <div class="section-head"><div><h2>Conversations</h2><p>Every reply, and how Harvey handled it.</p></div></div>
+  <div class="section-head" style="flex-wrap:wrap;gap:12px">
+    <div><h2>Conversations</h2><p>Percakapan WA &amp; Email dipisahkan per hari (WIB) agar setiap hari bersih dari chat kemarin.</p></div>
+    <div style="display:flex;gap:4px;background:var(--surface-2);padding:4px;border-radius:8px;border:1px solid var(--border)">
+      <button class="btn btn-sm btn-primary" id="cvrng-today" onclick="setConvoRange('today')">Hari Ini</button>
+      <button class="btn btn-sm" id="cvrng-yesterday" onclick="setConvoRange('yesterday')">Kemarin</button>
+      <button class="btn btn-sm" id="cvrng-week" onclick="setConvoRange('week')">7 Hari</button>
+      <button class="btn btn-sm" id="cvrng-all" onclick="setConvoRange('all')">Semua</button>
+    </div>
+  </div>
   <div id="conversations-list"></div>
 </div>
 
 <!-- Activity -->
 <div id="activity" class="section">
-  <div class="section-head"><div><h2>Activity</h2><p>A running log of every action Harvey's agents have taken.</p></div></div>
+  <div class="section-head" style="flex-wrap:wrap;gap:12px">
+    <div><h2>Activity</h2><p>Log kerja agen MAHORAGA per hari (WIB).</p></div>
+    <div style="display:flex;gap:4px;background:var(--surface-2);padding:4px;border-radius:8px;border:1px solid var(--border)">
+      <button class="btn btn-sm btn-primary" id="actrng-today" onclick="setActivityRange('today')">Hari Ini</button>
+      <button class="btn btn-sm" id="actrng-yesterday" onclick="setActivityRange('yesterday')">Kemarin</button>
+      <button class="btn btn-sm" id="actrng-week" onclick="setActivityRange('week')">7 Hari</button>
+      <button class="btn btn-sm" id="actrng-all" onclick="setActivityRange('all')">Semua</button>
+    </div>
+  </div>
   <div id="activity-list"></div>
 </div>
 
@@ -289,6 +468,36 @@
 
   <div class="subhead">Sending</div>
   <div id="sending-mode-card"></div>
+
+  <div class="subhead">AI Brain (Tokenizer.id), Auto WA &amp; Target Wilayah</div>
+  <div class="card" style="padding:16px;margin-bottom:18px">
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:12px">
+      <div class="form-group"><label class="form-label">Tokenizer API Key (kosongkan jika tidak ganti)</label><input id="ms-tok-key" type="password" class="form-input" placeholder="tz_..."></div>
+      <div class="form-group"><label class="form-label">Tokenizer Base URL</label><input id="ms-tok-url" class="form-input" placeholder="https://tokenizer.id/v1"></div>
+      <div class="form-group"><label class="form-label">Tokenizer Model</label>
+        <select id="ms-tok-model" class="form-input">
+          <option value="gpt-6.1-sol">gpt-6.1-sol</option>
+          <option value="gpt-6-sol">gpt-6-sol</option>
+          <option value="hy4">hy4</option>
+        </select>
+      </div>
+      <div class="form-group"><label class="form-label">Mode Auto-Reply WA</label>
+        <select id="ms-wa-mode" class="form-input">
+          <option value="full_auto">full_auto (Otomatis Penuh)</option>
+          <option value="safe">safe (Otomatis Aman)</option>
+          <option value="draft">draft (Review Outbox)</option>
+          <option value="off">off (Mati)</option>
+        </select>
+      </div>
+      <div class="form-group"><label class="form-label">Kuota WA / Hari</label><input id="ms-wa-max" type="number" class="form-input" value="30"></div>
+      <div class="form-group"><label class="form-label">Target Wilayah (pisahkan koma)</label><input id="ms-geo" class="form-input" placeholder="Karawang, Cikarang, Bekasi"></div>
+      <div class="form-group"><label class="form-label">Pengecualian / Partner (pisahkan koma)</label><input id="ms-excl" class="form-input" placeholder="fiwa, batavia, ..."></div>
+    </div>
+    <div style="margin-top:10px;display:flex;gap:10px;align-items:center">
+      <button class="btn btn-primary btn-sm" onclick="saveMahoragaSettings()">Simpan Pengaturan MAHORAGA</button>
+      <span id="ms-status" class="muted" style="font-size:12px"></span>
+    </div>
+  </div>
 
   <div class="subhead">Email provider <span class="hint">Active: <b id="active-provider">…</b> &middot; set <code>channels.email.provider</code> in <code>harvey.yaml</code> to gmail, microsoft, smtp or instantly</span></div>
   <div class="card">
@@ -444,13 +653,164 @@
       </div>
       <div class="status-meta" id="control-meta"></div>
       <div class="btn-group">
-        <button class="btn btn-primary" id="btn-start" onclick="startHarvey()">Start Harvey</button>
-        <button class="btn btn-danger" id="btn-stop" onclick="stopHarvey()" style="display:none">Stop Harvey</button>
+        <button class="btn btn-primary" id="btn-start" onclick="startHarvey()">Start Mahoraga</button>
+        <button class="btn btn-danger" id="btn-stop" onclick="stopHarvey()" style="display:none">Stop Mahoraga</button>
       </div>
     </div>
     <div class="card">
       <h2>Recent logs <button class="btn btn-ghost btn-sm" onclick="loadLogs()" style="margin-left:auto"><svg class="icon" aria-hidden="true"><use href="#i-refresh"/></svg>Refresh</button></h2>
       <div class="log-viewer" id="log-viewer">No logs yet. Start Harvey to see activity.</div>
+    </div>
+  </div>
+</div>
+
+<!-- Radar INAPROC & Mini Kompetisi v6 -->
+<div id="inaproc" class="section">
+  <div class="section-head">
+    <div>
+      <h2>Radar INAPROC &amp; Mini Kompetisi v6</h2>
+      <p>Dedicated Agent untuk memantau paket laboratorium, mencocokkan stok AndisLab, menjaga batas aman margin minimal 20%, dan submit otomatis ke E-Katalog v6.</p>
+    </div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;">
+      <button class="btn btn-primary btn-sm" id="inaproc-copilot-btn" onclick="runInaprocCopilotNow()">
+        <svg class="icon" aria-hidden="true"><use href="#i-sparkle"/></svg>Jalankan Co-Pilot
+      </button>
+      <button class="btn btn-ghost btn-sm" id="inaproc-scan-btn" onclick="scanInaprocNow()">
+        <svg class="icon" aria-hidden="true"><use href="#i-refresh"/></svg>Pindai Radar LPSE
+      </button>
+      <button class="btn btn-ghost btn-sm" onclick="loadInaproc()">Refresh</button>
+    </div>
+  </div>
+
+  <div class="card" style="margin-bottom:16px;padding:12px 16px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;background:var(--surface-2, rgba(255,255,255,0.02));">
+    <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;">
+      <div id="inaproc-session-status" style="font-weight:600;font-size:0.88rem;">
+        <span class="status-dot stopped"></span> Memeriksa sesi...
+      </div>
+      <div style="font-size:0.82rem;color:var(--text-3);border-left:1px solid var(--border);padding-left:12px;">
+        🛡️ Guardrail: <strong style="color:var(--good, #10b981);">Min. 20% di atas HPP</strong>
+      </div>
+      <div style="font-size:0.82rem;color:var(--text-3);border-left:1px solid var(--border);padding-left:12px;">
+        ⚡ Mode: <strong style="color:var(--accent, #3b82f6);">Co-Pilot Real Chrome (100% Lolos WAF)</strong>
+      </div>
+    </div>
+  </div>
+
+  <div id="inaproc-metrics" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px;margin-bottom:16px;"></div>
+
+  <div style="display:flex;gap:8px;margin-bottom:12px;border-bottom:1px solid var(--border);padding-bottom:8px;">
+    <button class="btn btn-sm btn-primary inaproc-subnav-btn" id="inaproc-subnav-bids" onclick="switchInaprocSubview('bids')">
+      ⚡ Penawaran Mini Kompetisi (Bids) <span id="inaproc-bids-count" class="badge t-good" style="margin-left:4px;">0</span>
+    </button>
+    <button class="btn btn-sm btn-ghost inaproc-subnav-btn" id="inaproc-subnav-radar" onclick="switchInaprocSubview('radar')">
+      🌐 Radar Paket Terpantau (LPSE &amp; SPSE)
+    </button>
+  </div>
+
+  <div id="inaproc-view-bids">
+    <div id="inaproc-bids-list" style="display:flex;flex-direction:column;gap:12px;">
+      <div class="card"><p style="color:var(--text-3)">Memuat daftar penawaran Mini Kompetisi...</p></div>
+    </div>
+  </div>
+
+  <div id="inaproc-view-radar" style="display:none;">
+    <div id="inaproc-list" style="display:flex;flex-direction:column;gap:12px;">
+      <div class="card"><p style="color:var(--text-3)">Memuat data peluang pengadaan...</p></div>
+    </div>
+  </div>
+</div>
+
+<!-- Telephony & Calling Desk Co-Pilot -->
+<div id="telephony" class="section">
+  <div class="section-head">
+    <div>
+      <h2>Calling Desk &amp; Voice AI (Nadia Voice Engine — Persona Wanita)</h2>
+      <p>Dual-Mode Telephony: Calling Desk Co-Pilot Nomor Kantor (PSTN) + Autonomous AI Voice Agent (Persona Wanita: Nadia Safitri, Suara: id-ID-GadisNeural).</p>
+    </div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;">
+      <button class="btn btn-primary btn-sm" onclick="startVoiceSimulator()">
+        🎙️ Uji Coba Suara Nadia (Simulator)
+      </button>
+      <button class="btn btn-ghost btn-sm" onclick="loadTelephonyQueue()">Refresh Antrean</button>
+    </div>
+  </div>
+
+  <!-- Android Tablet GSM Gateway Banner (Opsi 2) -->
+  <div class="card" style="padding:14px 16px;margin-bottom:16px;background:rgba(16,185,129,0.06);border:1px solid rgba(16,185,129,0.3);border-radius:8px;">
+    <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px;">
+      <div style="display:flex;align-items:center;gap:12px;">
+        <div style="font-size:1.6rem;">📱</div>
+        <div>
+          <h4 style="margin:0;font-size:0.95rem;display:flex;align-items:center;gap:8px;">
+            Tablet Kantor GSM Gateway (Opsi 2)
+            <span id="android-device-badge" class="badge" style="background:var(--border);color:var(--text-2);font-size:0.75rem;">Mengecek tablet...</span>
+          </h4>
+          <p id="android-device-desc" style="margin:4px 0 0;font-size:0.82rem;color:var(--text-3);">
+            Hubungkan tablet kantor berisi kartu SIM via kabel USB (aktifkan USB Debugging) atau Wi-Fi untuk panggilan otomatis ke nomor telepon kantor resmi (PSTN).
+          </p>
+        </div>
+      </div>
+      <div style="display:flex;gap:8px;align-items:center;">
+        <button class="btn btn-ghost btn-sm" onclick="checkAndroidDevices()">🔄 Cek Tablet</button>
+        <button id="btn-hangup-call" class="btn btn-danger btn-sm" style="display:none;background:#ef4444;color:#fff;border:none;" onclick="hangupAndroidCall()">🔴 Tutup Telepon</button>
+      </div>
+    </div>
+  </div>
+
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px;">
+    <!-- Column 1: Active Call / Simulator -->
+    <div class="card" style="padding:16px;">
+      <h3 style="margin-top:0;display:flex;align-items:center;gap:8px;">
+        <span class="status-dot live" style="background:#10b981;"></span>
+        Voice AI Simulator &amp; Audio Player (Nadia)
+      </h3>
+      <p style="font-size:0.85rem;color:var(--text-3);margin-bottom:12px;">
+        Simulasikan percakapan telepon dengan Nadia (Persona Wanita). Suara menggunakan <strong>Microsoft Neural ID Wanita (id-ID-GadisNeural)</strong> 100% gratis.
+      </p>
+
+      <div id="simulator-chat-box" style="height:220px;overflow-y:auto;background:rgba(0,0,0,0.2);padding:12px;border-radius:6px;border:1px solid var(--border);margin-bottom:12px;display:flex;flex-direction:column;gap:8px;font-size:0.88rem;">
+        <div style="color:var(--text-3);text-align:center;padding-top:80px;">Ketik respon prospek di bawah atau tekan tombol Kirim untuk memulai simulasi dialog.</div>
+      </div>
+
+      <div style="display:flex;gap:8px;">
+        <input type="text" id="sim-input-text" class="form-input" placeholder="Ketik perkataan prospek (contoh: Kami sudah ada vendor tetap dari Bandung)..." style="flex:1;" onkeydown="if(event.key==='Enter') sendSimulatedSpeech()">
+        <button class="btn btn-primary btn-sm" onclick="sendSimulatedSpeech()">Kirim &amp; Bicara</button>
+      </div>
+      <div id="audio-player-container" style="margin-top:10px;"></div>
+    </div>
+
+    <!-- Column 2: PSTN Co-Pilot Script & Battlecards -->
+    <div class="card" style="padding:16px;">
+      <h3 style="margin-top:0;">📋 Script Calling Desk (Nomor Kantor 021-38740154)</h3>
+      <div style="font-size:0.82rem;color:var(--text-3);margin-bottom:8px;">Taktik Lolos Resepsionis &amp; Pitching Kepala Lab:</div>
+      
+      <div style="background:rgba(255,255,255,0.03);padding:10px;border-radius:6px;border:1px solid var(--border);margin-bottom:10px;font-size:0.85rem;">
+        <strong>Resep Tembus Resepsionis:</strong><br>
+        <span id="script-receptionist">"Selamat siang Bu/Pak, saya Nadia dari PT Andis Sentral Laboratorium penyedia instrumen lab resmi. Izin dibantu sambungkan ke bagian Laboratorium / QC Pengadaan alat, terkait pengiriman katalog dan pembanding penawaran harga resmi."</span>
+      </div>
+
+      <div style="background:rgba(255,255,255,0.03);padding:10px;border-radius:6px;border:1px solid var(--border);margin-bottom:10px;font-size:0.85rem;">
+        <strong>Pitching Kepala Lab / Pengadaan:</strong><br>
+        <span id="script-pitch">"Selamat siang Bapak/Ibu, kami distributor 1.140+ ready stock Jabodetabek. Izin bertanya apakah saat ini ada rencana pengadaan alat baru atau reagen rutin yang membutuhkan draf SPH resmi pembanding?"</span>
+      </div>
+
+      <div style="display:flex;gap:8px;flex-wrap:wrap;">
+        <button class="btn btn-xs btn-ghost" onclick="showBattlecard('vendor')">🛡️ Lawan 'Sudah Ada Vendor'</button>
+        <button class="btn btn-xs btn-ghost" onclick="showBattlecard('anggaran')">💰 Lawan 'Belum Ada Anggaran'</button>
+        <button class="btn btn-xs btn-ghost" onclick="showBattlecard('email')">✉️ 'Kirimkan ke Email Saja'</button>
+      </div>
+      <div id="battlecard-box" style="margin-top:8px;font-size:0.82rem;color:var(--accent,#3b82f6);min-height:36px;"></div>
+    </div>
+  </div>
+
+  <!-- Calling Queue Table -->
+  <div class="card" style="padding:16px;">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
+      <h3 style="margin:0;">📞 Antrean Kontak Telepon Terverifikasi</h3>
+      <span id="telephony-queue-count" style="font-size:0.85rem;color:var(--text-3);">Memuat antrean...</span>
+    </div>
+    <div id="telephony-queue-table">
+      <p style="color:var(--text-3)">Memuat daftar antrean telepon...</p>
     </div>
   </div>
 </div>
@@ -559,6 +919,6 @@
 </main>
 </div>
 
-<script src="/static/app.js"></script>
+<script src="/static/app.js?v=20261113b"></script>
 </body>
 </html>

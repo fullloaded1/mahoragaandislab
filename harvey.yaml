@@ -1,118 +1,175 @@
 persona:
-  name: "Harvey"
-  company: "Your Company"
-  role: "Business Development"
-  email: "harvey@yourcompany.com"
-  linkedin: "linkedin.com/in/harvey-yourcompany"
-  tone: "professional, consultative, confident"
-
+  name: Ahnaf Ibrahim
+  company: PT Andis Sentral Laboratorium (AndisLab)
+  role: B2B Account Specialist (Alat & Reagen Laboratorium)
+  email: ahnafibrahim@andislabs.com
+  linkedin: linkedin.com/company/andislab
+  tone: profesional, hangat, lugas, dan terpercaya; perkenalkan AndisLab sebagai distributor resmi instrumen dan reagen laboratorium (1.100+ item ready stock Jabodetabek); tawarkan katalog produk dan kesiapan penerbitan penawaran harga resmi (SPH) sebagai referensi; hindari kata 'kendala teknis' atau 'pendampingan teknis' yang menimbulkan kesan konsultan servis/audit internal; tidak pernah menekan dengan diskon atau tenggat di pesan pertama
 product:
-  name: "Your Product"
-  description: "Describe what your product does and who it's for"
-  pricing: "Starting at $X/mo"
+  name: Promo Akhir Tahun 2026 — 1.140+ Item Ready Stock Gudang Jabodetabek
+  description: 'Jelang tutup buku 2026, PT Andis Sentral Laboratorium (AndisLab) menyediakan
+    1.140+ item alat & instrumen lab 100% Ready Stock di Gudang Jabodetabek (tanpa indent). Skema Diskon
+    Sesuai Cara Pembayaran: Diskon 8% (Tunai/Cash sebelum kirim), Diskon 5% (DP 50% PO lunas maks 14 hari),
+    Diskon 3% (DP 30% PO tempo 14 hari), Normal 0% (Tempo Instansi 30 Hari + Free Ongkir Jabodetabek).
+    Keunggulan: SPH resmi ber-KOP terbit 1x24 jam, dokumen SPJ, BAST & e-Faktur Pajak tuntas 2026,
+    gratis ongkir & uji fungsi Jabodetabek + Garansi 12 Bulan. Katalog & simulasi harga: https://www.andislab.com/promo-akhir-tahun.
+    WA: 0819-9157-5096.'
+  pricing: 'Diskon Tunai 8%, DP 50% Diskon 5%, DP 30% Diskon 3%, Tempo Instansi 30
+    Hari 0% (+ Free Ongkir Jabodetabek). Katalog & Simulasi: https://www.andislab.com/promo-akhir-tahun'
   key_benefits:
-    - "Benefit 1"
-    - "Benefit 2"
-    - "Benefit 3"
+  - 1.140+ item alat & instrumen lab 100% Ready Stock di gudang Jabodetabek — tanpa antre indent
+    impor menjelang tutup tahun
+  - 'Skema Diskon Transparan Sesuai Cara Pembayaran: Diskon 8% (Tunai/Cash), Diskon
+    5% (DP 50% PO), Diskon 3% (DP 30% PO), Normal 0% (Tempo 30 Hari)'
+  - SPH resmi ber-KOP terbit 1x24 jam lengkap dengan draft SPJ, BAST, dan e-Faktur
+    Pajak tuntas tahun anggaran 2026
+  - Gratis ongkir & uji fungsi Jabodetabek + Garansi Resmi 12 Bulan
+  - 'Katalog online interaktif & simulasi harga: https://www.andislab.com/promo-akhir-tahun'
+  - 'Tim Sales AndisLab WA: 0819-9157-5096'
   objection_responses:
-    "too expensive": "I understand budget is important. Most of our clients see ROI within 30 days..."
-    "already have a solution": "That makes sense. Curious — what's the one thing you wish it did better?"
-    "not interested": "No worries at all. Mind if I ask what your current approach looks like?"
+    harga terlalu mahal / anggaran terbatas: Kami punya 3 tier katalog sesuai plafon
+      anggaran (mulai Rp 1-30 Juta hingga Rp 200 Juta), harga Daihan Labtech kami
+      terbukti hingga 48% di bawah e-Katalog, plus ada diskon 8% untuk pembayaran
+      tunai. Boleh infokan plafon RAB yang sedang disiapkan agar kami sesuaikan rekomendasinya?
+    sudah punya vendor / distributor langganan: Sangat wajar. Banyak klien dari 500+
+      lab kampus, RSUD, dan pabrik memakai AndisLab sebagai pembanding SPH resmi atau
+      saat butuh unit ready stock tanpa indent 8-12 minggu. Apakah saat ini ada instrumen
+      yang sedang terkendala waktu tunggu indent?
+    harus lewat e-Katalog / pengadaan pemerintah: PT Andis Sentral Laboratorium sudah
+      terdaftar resmi di Katalog Elektronik INAPROC (katalog.inaproc.id/andis-sentral-laboratorium)
+      lengkap dengan draft SPJ, BAST, dan e-Faktur Pajak siap audit. Mau kami kirimkan
+      tautan etalase dan SPH pembanding untuk penyusunan HPS?
+    khawatir barang indent lama dan anggaran hangus: 'Justru itu keunggulan utama
+      program Klub Anti Indent kami: unit fisik 100% ready di gudang Bogor/Jabodetabek,
+      bisa video call atau inspeksi fisik langsung sebelum BAST, dan siap kirim dalam
+      1-7 hari kerja. Alat apa yang paling mendesak untuk diserap anggarannya?'
+    butuh jaminan purna jual, kalibrasi, dan sertifikat: Setiap unit dilengkapi garansi
+      resmi principal 12 bulan, uji fungsi QC sebelum kirim, COA bila tersedia, serta
+      dukungan teknisi bersertifikat untuk instalasi dan kalibrasi standar ISO 17025
+      / CPOB. Apakah lab Anda sedang mempersiapkan audit akreditasi dalam waktu dekat?
+    belum ada kebutuhan pengadaan saat ini: Tidak masalah. Kami bisa mengirimkan Katalog
+      PDF 2026 & daftar harga referensi HPS terlebih dahulu agar tim lab punya acuan
+      spesifikasi saat penyusunan RAB berikutnya. Boleh kami kirimkan ke email ini?
   offer:
-    primary: ""                    # Main offer (e.g., "Monthly subscription starting at $99/mo")
-    entry: ""                      # Low-commitment entry (e.g., "14-day free trial", "Free audit")
-    goal: "book_call"              # Goal of outreach: book_call, start_trial, get_reply
-    booking_method: "calendar_link" # calendar_link, suggest_times, ask_preference
-    booking_url: ""                # Calendar link URL (if using calendar_link method)
-    meeting_duration: "15 minutes" # How long the call is
-    meeting_owner: ""              # Who takes the meeting (name or role)
-
+    primary: Promo Akhir Tahun 2026 — 1.140+ Unit Ready Stock Gudang Jabodetabek (Diskon
+      Sesuai Cara Bayar)
+    entry: Surat Penawaran Harga (SPH) Resmi 1x24 Jam + Katalog PDF A4 + Simulasi
+      Diskon di andislab.com/promo-akhir-tahun
+    goal: get_reply
+    booking_method: ask_preference
+    booking_url: https://www.andislab.com
+    meeting_duration: 15 minutes
+    meeting_owner: Tim Engineering & Konsultan Pengadaan AndisLab
 icp:
   industries:
-    - "SaaS"
-    - "Marketing Agency"
-  company_size: "10-200 employees"
+  - Laboratory & Research
+  - Pharmaceutical & Medical
+  - Hospital & Clinic
+  - Manufacturing & Factory QC
+  - University & Higher Education
+  company_size: 20-1000 employees
   titles:
-    - "VP Marketing"
-    - "Head of Growth"
-    - "CMO"
-    - "Director of Marketing"
+  - Kepala Laboratorium
+  - Laboratory Manager
+  - Lab Manager
+  - QA/QC Manager
+  - Quality Control Manager
+  - Quality Assurance Manager
+  - Purchasing Manager
+  - Procurement Manager
+  - Pejabat Pembuat Komitmen
+  - PPK
+  - Head of R&D
+  - R&D Manager
+  - Plant Manager
+  - Factory Manager
+  - Direktur
+  - Owner
   geography:
-    - "United States"
-  # Roles that signal a company is in-market RIGHT NOW (a company hiring a
-  # "Head of Growth" is shopping for growth tooling). Used for careers-page
-  # scanning and job-board discovery. Empty = fall back to titles above.
-  hiring_signals: []
-
+  - Jakarta, Indonesia
+  - Bogor, Indonesia
+  - Bekasi, Indonesia
+  - Tangerang, Indonesia
+  - Bandung, Indonesia
+  - Surabaya, Indonesia
+  geo_coordinates:
+    Jakarta, Indonesia: -6.2088,106.8456,30
+    Bogor, Indonesia: -6.5971,106.8060,25
+    Bekasi, Indonesia: -6.2383,106.9756,25
+    Tangerang, Indonesia: -6.1783,106.6319,25
+    Bandung, Indonesia: -6.9175,107.6191,25
+    Surabaya, Indonesia: -7.2575,112.7521,25
+  hiring_signals:
+  - Quality Control
+  - Analis Kimia
+  - Mikrobiologi
+  - Laboran
+  - Lab Analyst
+  - R&D
 channels:
   email:
     enabled: true
-    provider: "gmail"          # gmail (recommended) | microsoft | smtp | instantly
+    provider: smtp
     max_daily_sends: 50
-    require_approval: true      # native: review in Outbox; Instantly: sending held
-    # link_domains: ["mainsite.com"]   # your own sites besides the sending
-    #                                  # domain and booking link; on autopilot,
-    #                                  # an email linking elsewhere waits for you
-    send_to_risky: false        # also send to catch-all domains (off = safest)
-    max_bounce_rate: 0.05       # pause all sending if bounces exceed this
-    # New sending domain? Set start_date to the day your warmup service went
-    # on: no cold email for min_days, then the cold cap climbs from
-    # start_sends by daily_increase a day up to max_daily_sends. Replies are
-    # never held. Gmail/Microsoft/SMTP only (Instantly has its own warmup).
-    # Check readiness any time with `harvey warmup`.
+    require_approval: false
+    link_domains:
+    - andislab.com
+    - katalog.inaproc.id
+    send_to_risky: true
+    max_bounce_rate: 0.05
     warmup:
-      start_date: ""            # YYYY-MM-DD; blank = no ramp
+      start_date: ''
       min_days: 14
       start_sends: 5
       daily_increase: 3
-      dkim_selector: ""         # only if your provider uses an unusual one
-    # Send cold email only in office hours in each recipient's own time zone,
-    # worked out from the company's location or the country Precleared finds.
-    # Anyone Harvey can't place gets the window in usage.quiet_hours.timezone.
-    # Follow-ups move into the window; replies are never held. Quiet hours
-    # then stop prospecting and writing, not mail that's due.
-    # Gmail/Microsoft/SMTP only. Remove the # marks to switch it on.
-    # send_window:
-    #   start: "08:00"
-    #   end: "17:00"
-    #   weekdays_only: true      # Monday to Friday, in every country
-    #   recipient_timezone: true  # false: one zone for everyone (quiet_hours.timezone)
+      dkim_selector: ''
   linkedin:
-    enabled: false             # explicit opt-in; credentials alone do not enable it
+    enabled: false
     max_daily_connections: 20
-    max_daily_messages: 10
-
-# Which subscription/provider Harvey thinks with: claude (default), codex, or gemini.
-# brain:
-#   provider: gemini             # gemini | claude | codex
-#   model: gemini-2.5-flash      # gemini-2.5-flash (default) | gemini-2.5-pro
-
+    max_daily_messages: 30
+  whatsapp:
+    enabled: true
+    provider: openwa
+    openwa_base_url: http://localhost:2785
+    openwa_api_key: owa_k1_f38b4dcd8ad568fcb530d6abdc7de5a81b051806bcd6c9ad3ac446b06d893dc6
+    openwa_session_id: andisbot
+    auto_reply_mode: draft
+    max_daily_messages: 30
+    max_per_cycle: 2
+    min_delay_seconds: 60
+    max_delay_seconds: 120
+    work_hours_start: '08:30'
+    work_hours_end: '16:45'
+    warm_only: false
+    report_phone: 087764021131
+    report_time: '17:00'
+    auto_report: true
+    quote_followup_enabled: true
+brain:
+  provider: gemini
+  model: gemini-3.8-flash
 usage:
   max_daily_claude_percent: 80
   heartbeat_interval_minutes: 15
   quiet_hours:
-    start: "22:00"
-    end: "07:00"
-    timezone: "America/New_York"
-
-# Optional: check each new recipient with Precleared (precleared.dev) before
-# the first cold email: may cold marketing email go to this address under UK
-# PECR, US CAN-SPAM, Canada's CASL, Germany's UWG and France's rules? Any other
-# answer holds the email back, with the reason in the Outbox. One check per
-# address; 10 a day free without a key, 25 with a free key (PRECLEARED_API_KEY
-# in .env). Applies to the native providers (gmail, microsoft, smtp). If all
-# your prospects are in one country, set prospect_country: Precleared uses it
-# only when it can't tell the country from the address, company records or the
-# company's website.
+    start: 00:00
+    end: 00:00
+    timezone: Asia/Jakarta
 compliance:
-  # Added under every cold email (never replies). US law (CAN-SPAM) requires a
-  # postal address you receive mail at: a street address, PO box or virtual
-  # mailbox. Until it's set, cold email still sends, with a warning.
-  postal_address: ""
-  # Keep wording Harvey recognises as an opt-out ("no thanks", "unsubscribe").
-  opt_out_line: 'Not interested? Reply "no thanks" and I won''t email again.'
+  postal_address: Jl. Raya Mayor Oking Jaya Atmaja No.112, Cirimekar, Kec. Cibinong,
+    Kabupaten Bogor, Jawa Barat 16918
+  opt_out_line: Tidak tertarik? Reply "no thanks" dan kami tidak akan mengirimkan
+    email lagi.
+  partner_exclusions:
+  - batavia
+  - kuku
+  - andis kukuh
+  - cmsi
+  - cahayatiara
+  - indotrading
+  - indotrading.com
   precleared:
     enabled: false
-    sender_country: ""          # GB or US: where your business is based
-    address_source: "unknown"   # published | bought | scraped | given | unknown
-    prospect_country: ""        # optional, e.g. US if all your prospects are in one country
+    sender_country: ''
+    address_source: published
+    prospect_country: ''

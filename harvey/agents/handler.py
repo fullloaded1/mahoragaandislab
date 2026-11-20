@@ -200,6 +200,7 @@ class Handler:
         self.brain = brain
         self.state = state
         self.config = config
+        self.env = env
         self.instantly = InstantlyClient(env.instantly_api_key)
         self.provider = get_mail_provider(config, env)
         self.skills = ""
@@ -437,6 +438,23 @@ class Handler:
         if intent not in NO_COMPANY_STOP_INTENTS:
             await self._stop_colleagues(prospect)
 
+        # Send instant Hot Lead Alert via WhatsApp if interested/question/escalate
+        if intent in ("interested", "question", "escalate"):
+            try:
+                from harvey.integrations.whatsapp import WhatsAppEngine
+                wa_engine = WhatsAppEngine(self.state, self.config, self.env)
+                name_str = f"{prospect.first_name or ''} {prospect.last_name or ''}".strip() or lead_email
+                await wa_engine.notify_hot_lead(
+                    name=name_str,
+                    company=prospect.company or "",
+                    channel="Email",
+                    contact_info=lead_email,
+                    intent=intent,
+                    message_snippet=reply_text[:250],
+                )
+            except Exception as e:
+                logger.debug(f"Handler: Hot lead WhatsApp alert skipped: {e}")
+
         # 2. The conversation as it will be, in memory only. Nothing about
         # this reply is stored until every model call it needs has succeeded:
         # if the provider goes down part-way (BrainUnavailable), the reply is
@@ -570,6 +588,7 @@ class Handler:
             await self._queue_native_reply(
                 response, prospect, convo, reply_meta or {}, intent
             )
+            await self._auto_queue_email_referrals(reply_text, prospect, lead_email, intent)
         elif await self.state.get_setting(REVIEW_NEXT_REPLY_KEY + prospect.id):
             # You undid their opt-out, and Instantly can't hold a reply for
             # approval: the first answer after an undo is yours to send.
@@ -769,6 +788,46 @@ class Handler:
                 details={"prospect_email": prospect.email, "intent": intent,
                          "response_preview": response[:100]},
             )
+            # Notify operator via WhatsApp if review is required
+            if require_approval and getattr(self.config.channels, "whatsapp", None) and self.config.channels.whatsapp.enabled:
+                try:
+                    from harvey.integrations.whatsapp import WhatsAppEngine
+                    wa_engine = WhatsAppEngine(self.state, self.config, self.env)
+                    name_str = f"{prospect.first_name or ''} {prospect.last_name or ''}".strip() or prospect.email
+                    alert_msg = (
+                        f"📧 *[INBOUND EMAIL - REVIEW DRAF BALASAN]*\n"
+                        f"━━━━━━━━━━━━━━━━━━━━━\n"
+                        f"👤 *Nama:* {name_str}\n"
+                        f"🏢 *Instansi:* {prospect.company or '-'}\n"
+                        f"✉️ *Email:* {prospect.email}\n"
+                        f"🎯 *Intent:* {intent}\n"
+                        f"📌 *Subjek:* {subject}\n\n"
+                        f"📝 *Draf Balasan Email Ahnaf:*\n"
+                        f"> {response[:250]}...\n\n"
+                        f"👉 *Tindakan Operator (Balas WhatsApp ini):*\n"
+                        f"• Ketik *OK EMAIL* untuk langsung kirim balasan email ini\n"
+                        f"• Ketik *BATAL EMAIL* untuk membatalkan draf ini\n"
+                        f"Atau buka Dashboard: http://127.0.0.1:5555/#today"
+                    )
+                    await wa_engine.send_system_alert(alert_msg)
+                except Exception as e:
+                    logger.debug(f"Handler: WhatsApp alert for email review skipped: {e}")
+
+            # Sync to Obsidian Second Brain
+            if getattr(self.config, "obsidian", None) and self.config.obsidian.enabled:
+                try:
+                    from harvey.integrations.obsidian_memory import ObsidianMemory
+                    vault = ObsidianMemory(self.config.obsidian.vault_path)
+                    vault.log_chat_event(
+                        phone=prospect.phone or prospect.email,
+                        name=f"{prospect.first_name or ''} {prospect.last_name or ''}".strip() or prospect.email,
+                        company=prospect.company or "",
+                        direction="outbound",
+                        message=response,
+                        intent=f"EMAIL_REPLY_DRAFT:{intent}"
+                    )
+                except Exception:
+                    pass
 
     def _instantly_reply_held(self, prospect, response: str) -> list[str]:
         """Why an Instantly reply must not go out by itself, or []."""
@@ -778,6 +837,15 @@ class Handler:
 
     async def _classify_intent(self, reply_text: str, prospect) -> str:
         """Ask the brain to classify the reply's intent."""
+        # Zero-token bypass for closing acknowledgments on email
+        try:
+            from harvey.integrations.whatsapp import is_closing_acknowledgment
+            if is_closing_acknowledgment(reply_text.strip()):
+                logger.info("Handler: Closing courtesy detected in email. Categorizing as 'not_interested' (0 token).")
+                return "not_interested"
+        except Exception:
+            pass
+
         prompt = f"""Classify this email reply into exactly ONE category:
 - "interested" — wants to learn more, open to a meeting, positive response
 - "objection" — has concerns but hasn't said no (price, timing, competition)
@@ -901,7 +969,71 @@ Product: {self.config.product.name} — {self.config.product.description}"""
             if playbook:
                 prompt += "\n\nSELLING TO STARTUP FOUNDERS\n" + playbook
 
-        prompt += f"""
+        # Inject Parlant-style Behavioral Guidelines (Condition -> Action)
+        try:
+            from harvey.guidelines import GuidelineEngine
+            g_engine = GuidelineEngine()
+            matched_g = g_engine.match_guidelines(
+                reply_text,
+                customer_context={
+                    "company": getattr(prospect, "company", ""),
+                    "industry": getattr(prospect, "industry", ""),
+                },
+            )
+            g_block = g_engine.format_prompt_block(matched_g)
+            if g_block:
+                prompt += f"\n\n{g_block}\n"
+        except Exception as e:
+            logger.debug(f"GuidelineEngine injection skipped: {e}")
+
+        # Inject Real Inventory Match (BM25Okapi + 1,142 SKUs) & Mahoraga Adaptation Wheel
+        inventory_block = ""
+        try:
+            from harvey.integrations.product_matcher import match_product
+            pm_res = match_product(reply_text)
+            if pm_res and pm_res.get("status") in ("EXACT", "CLARIFICATION") and pm_res.get("item"):
+                it = pm_res["item"]
+                alts = pm_res.get("alternatives", [])[:2]
+                lines = [
+                    f"- {it.get('name')} ({it.get('brand', 'Resmi')} {it.get('model', '-')}) — "
+                    f"Harga Katalog: Rp {float(it.get('price') or 0):,.0f} | Spek: {it.get('specifications', '-')}"
+                ]
+                for a in alts:
+                    lines.append(
+                        f"- Alternatif: {a.get('name')} ({a.get('brand', 'Resmi')} {a.get('model', '-')}) — "
+                        f"Rp {float(a.get('price') or 0):,.0f}"
+                    )
+                inventory_block = "\n\nDATA INVENTORY RESMI ANDISLAB (WAJIB PAKAI DATA INI, DILARANG MENGARANG):\n" + "\n".join(lines)
+            elif pm_res and pm_res.get("status") in ("SPAREPART_CHECK", "ALTERNATIVE_BRAND"):
+                inventory_block = (
+                    f"\n\nPROTOKOL SPAREPART / MERK KHUSUS:\n"
+                    f"Klien menanyakan item yang belum ada di stok utama ({pm_res.get('recommendation_text')}). "
+                    f"Jangan mengarang harga/barang lain! Gunakan panduan: {pm_res.get('clarification_message')}"
+                )
+        except Exception as e:
+            logger.debug(f"Handler product_matcher skipped: {e}")
+
+        adaptation_block = ""
+        try:
+            adaptations = await self.state.get_recent_adaptations(limit=5)
+            if adaptations:
+                ad_lines = [
+                    f"{idx}. [Draf Awal]: \"{(ad.get('ai_draft') or '')[:80]}...\" -> [Koreksi Operator]: \"{(ad.get('final_text') or '')[:160]}\""
+                    for idx, ad in enumerate(adaptations, 1)
+                ]
+                adaptation_block = "\n\nRODA ADAPTASI MAHORAGA (PELAJARI KOREKSI OPERATOR INI):\n" + "\n".join(ad_lines)
+        except Exception:
+            pass
+
+        # Inject Mahoraga Agency Sales Playbook (adapted from msitarzewski/agency-agents)
+        try:
+            pb_path = PROJECT_ROOT / "skills" / "mahoraga_agency_sales.md"
+            if pb_path.exists():
+                prompt += "\n\nMAHORAGA AGENCY SALES PLAYBOOK:\n" + pb_path.read_text(encoding="utf-8")[:1500]
+        except Exception:
+            pass
+
+        prompt += f"""{inventory_block}{adaptation_block}
 
 Conversation so far:
 {fence(history, "the conversation")}
@@ -961,3 +1093,84 @@ Write a reply that:"""
             enabled=humanizer_enabled(self.config),
         )
         return polished[0]["body"]
+
+    async def _auto_queue_email_referrals(
+        self, reply_text: str, prospect, lead_email: str, intent: str
+    ) -> int:
+        """Extract referred email addresses from replies and auto-queue outreach to them."""
+        if intent not in ("wrong_person", "interested", "question"):
+            return 0
+        import re
+        import uuid
+        candidates = re.findall(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}", reply_text or "")
+        own_email = (getattr(self.config.persona, "email", "") or "").lower()
+        seen: set[str] = set()
+        ref_emails: list[str] = []
+        for em in candidates:
+            low = em.lower().strip(".,;:")
+            if low in seen or low == (lead_email or "").lower() or low == own_email:
+                continue
+            if any(skip in low for skip in ("andislab", "noreply", "no-reply", "mailer-daemon", "postmaster")):
+                continue
+            seen.add(low)
+            ref_emails.append(low)
+        if not ref_emails:
+            return 0
+
+        now_iso = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
+        require_app = bool(getattr(self.config.channels.email, "require_approval", True))
+        ob_status = "pending_review" if require_app else "approved"
+        queued = 0
+        async with self.state._connect() as db:
+            for ref_em in ref_emails:
+                exists_p = await (await db.execute("SELECT id FROM prospects WHERE lower(email) = ?", (ref_em,))).fetchone()
+                exists_o = await (await db.execute("SELECT id FROM outbox WHERE lower(to_email) = ? AND status IN ('approved','sent','pending_review')", (ref_em,))).fetchone()
+                if exists_o:
+                    continue
+                ref_pid = exists_p[0] if exists_p else f"ref_{uuid.uuid4().hex[:10]}"
+                if not exists_p:
+                    await db.execute(
+                        """INSERT OR IGNORE INTO prospects
+                           (id, first_name, last_name, company, title, email, email_status, status, source, personalization_notes, created_at, updated_at)
+                           VALUES (?, 'Tim Pengadaan / Logistik', '', ?, 'PIC Pengadaan', ?, 'verified', 'queued', 'email_referral', ?, ?, ?)""",
+                        (ref_pid, prospect.company or "", ref_em, f"[REFERRAL dari {lead_email}]", now_iso, now_iso),
+                    )
+                subj = f"Perkenalan & Katalog Alat Laboratorium - {prospect.company or 'Pengadaan'}"
+                body = (
+                    f"Yth. Bapak/Ibu PIC Pengadaan ({prospect.company or 'Instansi'}),\n\n"
+                    f"Kami mendapatkan rujukan kontak Bapak/Ibu dari {lead_email}. "
+                    f"Perkenalkan saya {self.config.persona.name} dari {self.config.persona.company}, distributor resmi instrumen, glassware, dan reagen laboratorium (1.140+ item ready stock Jabodetabek, garansi resmi 12 bulan, siap dukungan dokumen SPJ/BAST/e-Faktur).\n\n"
+                    f"Bolehkah kami kirimkan Company Profile & katalog produk kami sebagai bahan referensi pengadaan tim?\n\n"
+                    f"Hormat kami,\n{self.config.persona.name}\n{self.config.persona.company}"
+                )
+                await self.state.add_outbox_item(
+                    prospect_id=ref_pid,
+                    campaign_id="",
+                    step=1,
+                    kind="sequence",
+                    to_email=ref_em,
+                    subject=subj,
+                    body=body,
+                    send_at=now_iso,
+                    status=ob_status,
+                    provider="smtp",
+                    approved_by="autopilot" if ob_status == "approved" else "",
+                )
+                queued += 1
+            # Lock original wrong_person contact so we don't keep emailing them
+            if queued > 0 and intent == "wrong_person":
+                await db.execute(
+                    """UPDATE prospects
+                       SET status = 'opted_out',
+                           personalization_notes = trim(coalesce(personalization_notes,'') || ' | [REFERRED_TO_PIC:' || ? || ']', ' |')
+                       WHERE id = ?""",
+                    (",".join(ref_emails), prospect.id),
+                )
+            await db.commit()
+        if queued > 0:
+            await self.state.log_action(
+                action_type="email_referral_queued",
+                agent="handler",
+                details={"company": f"{prospect.company} -> {', '.join(ref_emails)}", "count": queued},
+            )
+        return queued

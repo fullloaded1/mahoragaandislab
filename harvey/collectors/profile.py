@@ -1112,6 +1112,15 @@ class ProfileCollector:
             return obs
         self.site_names[company_id] = site_name_from_html(home, domain)
 
+        # Extract WhatsApp number if present on the website
+        from harvey.integrations.whatsapp import extract_whatsapp_from_html
+        wa_number = extract_whatsapp_from_html(home)
+        if wa_number and getattr(self, "state", None) is not None:
+            try:
+                await self.state.update_company_phone(company_id, wa_number)
+            except Exception:
+                pass
+
         # Ads (they are spending TODAY — the strongest budget signal here)
         add("RUNNING_GOOGLE_ADS", num=1 if self._any(home, GOOGLE_ADS) else 0)
         add("RUNNING_META_ADS", num=1 if self._any(home, META_PIXEL) else 0)

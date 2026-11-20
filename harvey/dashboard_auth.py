@@ -264,7 +264,7 @@ def parse_host(value: str) -> str | None:
 
 
 def is_loopback(host: str) -> bool:
-    if host == "localhost":
+    if host in ("localhost", "host.docker.internal"):
         return True
     if "%" in host:
         return False  # IPv6 zone IDs (::1%lo0): ipaddress calls them loopback
@@ -275,6 +275,8 @@ def is_loopback(host: str) -> bool:
 
 
 def is_public_path(method: str, path: str) -> bool:
+    if method == "POST" and path in ("/api/whatsapp/webhook", "/api/fonnte/webhook"):
+        return True
     if method not in ("GET", "HEAD"):
         return False
     if path == "/":
@@ -302,10 +304,12 @@ def _is_json(content_type: str) -> bool:
 class DashboardGuard:
     """ASGI middleware applying the checks in the module docstring to every
     request, and the security headers to every response."""
+    ALLOW_REMOTE: bool = False
 
-    def __init__(self, app, store: TokenStore):
+    def __init__(self, app, store: TokenStore, allow_remote: bool = False):
         self.app = app
         self.store = store
+        self.allow_remote = allow_remote
 
     async def __call__(self, scope, receive, send):
         if scope["type"] == "lifespan":
@@ -340,7 +344,8 @@ class DashboardGuard:
         # 1. Host, before anything else.
         hosts = headers.get("host", [])
         host = parse_host(hosts[0]) if len(hosts) == 1 else None
-        if host is None or not is_loopback(host):
+        allow_remote = getattr(self, "allow_remote", False) or getattr(DashboardGuard, "ALLOW_REMOTE", False)
+        if host is None or (not allow_remote and not is_loopback(host)):
             return await deny(400, "bad_host",
                               "This dashboard only answers to localhost / 127.0.0.1.")
         host_header = hosts[0].lower()
@@ -351,7 +356,8 @@ class DashboardGuard:
                       and headers.get("sec-fetch-mode", [""])[0] == "navigate"
                       and headers.get("sec-fetch-dest", [""])[0] == "document")
         origins = headers.get("origin", [])
-        if origins and (len(origins) != 1 or origins[0].lower() != f"http://{host_header}"):
+        allowed_origins = {f"http://{host_header}", f"https://{host_header}"}
+        if origins and (len(origins) != 1 or origins[0].lower() not in allowed_origins):
             if not navigation:
                 return await deny(403, "cross_origin", "Cross-origin requests are refused.")
         site = headers.get("sec-fetch-site", [])

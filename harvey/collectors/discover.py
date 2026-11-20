@@ -52,6 +52,8 @@ JUNK_DOMAIN_PATTERNS = tuple(re.compile(p, re.I) for p in (
     r"(^|\.)(yelp|yellowpages|superpages|manta|bbb|angi|angieslist|homeadvisor)\.",
     r"(^|\.)(thumbtack|houzz|porch|buildzoom|networx|modernize|nextdoor)\.",
     r"(^|\.)(facebook|instagram|twitter|x|linkedin|youtube|tiktok|pinterest)\.",
+    # job boards & recruitment portals (never prospect job platforms)
+    r"(^|\.)(glints|jobleads|hiredtoday|jobstreet|kalibrr|loker|karir|jobs|recruitment|topkarir)\.",
     r"(^|\.)(indeed|glassdoor|ziprecruiter|craigslist|zillow|realtor)\.",
     r"(^|\.)(mapquest|foursquare|tripadvisor|trustpilot|birdeye|expertise)\.",
     r"(directory|listings?|find-?a-|top\d+|best-?of)\.",
@@ -59,9 +61,7 @@ JUNK_DOMAIN_PATTERNS = tuple(re.compile(p, re.I) for p in (
     r"(^|\.)(wikipedia|reddit|quora|medium|substack|forbes|inc|entrepreneur)\.",
     r"(news|magazine|journal|gazette|tribune|herald)\.(com|org|net)$",
     # institutional
-    r"\.(edu|gov|mil)$",
-    r"(hospital|healthsystem|medicalcenter)\.",
-    r"health\.org$",
+    r"\.(mil)$",
     # startup databases, launch sites and tech press (the YC preset's noise)
     r"(^|\.)(ycombinator|workatastartup|startupschool|yclist|ycdb|seedtable)\.",
     r"(^|\.)(crunchbase|techcrunch|wellfound|angel|tracxn|pitchbook)\.",
@@ -853,6 +853,16 @@ class OpenStreetMap(DiscoveryProvider):
         "attorney": ['office=lawyer'],
         "contractor": ['craft=builder', 'office=construction_company'],
         "landscap": ['craft=gardener', 'shop=garden_centre'],
+        "lab": ['healthcare=laboratory', 'office=research'],
+        "pharma": ['industrial=pharmaceutical', 'healthcare=laboratory', 'man_made=works'],
+        "farmasi": ['industrial=pharmaceutical', 'healthcare=laboratory', 'man_made=works'],
+        "hospital": ['amenity=hospital', 'amenity=clinic'],
+        "rumah sakit": ['amenity=hospital', 'amenity=clinic'],
+        "clinic": ['amenity=clinic', 'healthcare=laboratory'],
+        "klinik": ['amenity=clinic', 'healthcare=laboratory'],
+        "universit": ['amenity=university', 'amenity=college'],
+        "manufactur": ['man_made=works', 'industrial=factory'],
+        "pabrik": ['man_made=works', 'industrial=factory'],
     }
 
     def _tags(self, term: str) -> list[str]:

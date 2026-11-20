@@ -164,8 +164,12 @@ async def decide_next_action(
     elif writable > 0:
         action, reason = "write_campaign", f"{writable} new prospect(s) with no drafts ready"
     elif unusable_backlog_notice(summary):
-        action, reason = "idle", "a day's worth of prospects with no usable email"
-        logger.warning(unusable_backlog_notice(summary))
+        wa_on = bool(getattr(getattr(config, "channels", None), "whatsapp", None) and config.channels.whatsapp.enabled)
+        if wa_on:
+            action, reason = "prospect", "email backlog paused, continuing prospecting for active WhatsApp channel"
+        else:
+            action, reason = "idle", "a day's worth of prospects with no usable email"
+            logger.warning(unusable_backlog_notice(summary))
     else:
         action, reason = "prospect", f"{new_prospects} new prospect(s), none ready to write for"
 
@@ -185,25 +189,34 @@ async def _run_agents(tasks: list) -> dict:
         return {}
     if len(tasks) > 1:
         logger.info(f"Running {len(tasks)} agents in parallel: {[t[0] for t in tasks]}")
-    try:
-        results = await asyncio.wait_for(
-            asyncio.gather(*[t[1] for t in tasks], return_exceptions=True),
-            timeout=CYCLE_TIMEOUT_SECONDS,
-        )
-    except asyncio.TimeoutError:
+    # pyrefly: ignore[parse-error]
+    task_objs= [(name, asyncio.ensure_future(coro)) for name, coro in tasks]
+    done, pending = await asyncio.wait(
+        [t for _, t in task_objs], timeout=CYCLE_TIMEOUT_SECONDS
+    )
+    if pending:
+        still_running = [name for name, t in task_objs if t in pending]
         logger.error(
             f"Cycle timed out after {CYCLE_TIMEOUT_SECONDS}s with "
-            f"{[t[0] for t in tasks]} still running — cancelled, "
+            f"{still_running} still running — cancelled, "
             "moving on to the next heartbeat instead of hanging forever."
         )
-        results = []
+        for t in pending:
+            t.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
     outcomes = {}
-    for (name, _), result in zip(tasks, results):
-        if isinstance(result, asyncio.CancelledError):
-            raise result
-        if isinstance(result, Exception):
-            logger.error(f"Agent {name} failed: {result}", exc_info=result)
-        outcomes[name] = result
+    for name, t in task_objs:
+        if t in pending:
+            continue
+        try:
+            result = t.result()
+        except asyncio.CancelledError:
+            raise
+        except Exception as result_exc:
+            logger.error(f"Agent {name} failed: {result_exc}", exc_info=result_exc)
+            outcomes[name] = result_exc
+        else:
+            outcomes[name] = result
     return outcomes
 
 
@@ -281,16 +294,153 @@ async def heartbeat(stop_event: asyncio.Event | None = None):
     from harvey.agents.sender import Sender
     from harvey.agents.handler import Handler
     from harvey.agents.analyst import Analyst
+    from harvey.integrations.whatsapp import WhatsAppEngine
+    from harvey.integrations.inaproc_watcher import InaprocWatcher, format_inaproc_alert_message
+    from harvey.agents.inaproc_agent import InaprocAgent
 
     scout = Scout(brain, state, config, env)
     writer = Writer(brain, state, config, env)
     sender = Sender(brain, state, config, env)
     handler = Handler(brain, state, config, env)
     analyst = Analyst(state)
+    whatsapp = WhatsAppEngine(state, config, env)
+    inaproc_watcher = InaprocWatcher()
+    inaproc_agent = InaprocAgent(state, config, env, brain, min_margin=0.20)
 
     interval = config.usage.heartbeat_interval_minutes * 60
     max_calls = max(int(200 * (config.usage.max_daily_claude_percent / 100)), 1)
     consecutive_errors = 0
+
+    async def _daily_report_ticker():
+        """Ensure daily WhatsApp report is dispatched at exact report_time (e.g. 17:00 WIB) once per day."""
+        import pytz
+        from datetime import datetime
+        last_sent_date = None
+        try:
+            act = whatsapp._load_activity()
+            last_sent_date = act.get("last_report_date")
+        except Exception:
+            pass
+
+        while not stop_event.is_set():
+            try:
+                wa_cfg = getattr(config.channels, "whatsapp", None)
+                if wa_cfg and wa_cfg.enabled and wa_cfg.auto_report and wa_cfg.report_phone:
+                    now_jkt = datetime.now(pytz.timezone("Asia/Jakarta"))
+                    curr_hhmm = now_jkt.strftime("%H:%M")
+                    target_time = wa_cfg.report_time or "17:00"
+                    today_str = now_jkt.date().isoformat()
+                    act = whatsapp._load_activity()
+                    file_last_report = act.get("last_report_date")
+
+                    if curr_hhmm >= target_time and last_sent_date != today_str and file_last_report != today_str:
+                        # Lock out immediately in memory and file to prevent duplicate triggers
+                        last_sent_date = today_str
+                        act["last_report_date"] = today_str
+                        whatsapp._save_activity(act)
+                        logger.info(f"WhatsApp: Jam {curr_hhmm} WIB tercapai (jadwal: {target_time}). Mengirimkan auto-report harian ke {wa_cfg.report_phone}...")
+                        await whatsapp.send_daily_report(force=True)
+            except Exception as ex:
+                logger.warning(f"WhatsApp: Error in daily report ticker: {ex}")
+            if await _interruptible_sleep(30, stop_event):
+                break
+
+    report_ticker_task = asyncio.create_task(_daily_report_ticker())
+
+    async def _procurement_scan_ticker():
+        """Monitor INAPROC / LPSE and Mini Kompetisi daily at 08:30 WIB (morning procurement release)."""
+        import pytz
+        from datetime import datetime
+        last_scan_date = None
+        try:
+            act = inaproc_watcher.load_activity()
+            last_scan_date = act.get("last_scan_date")
+        except Exception:
+            pass
+
+        last_patrol_time = None
+        while not stop_event.is_set():
+            try:
+                now_jkt = datetime.now(pytz.timezone("Asia/Jakarta"))
+                curr_hhmm = now_jkt.strftime("%H:%M")
+                
+                # Active patrol window: 08:00 to 17:30 WIB, every 60 minutes
+                is_working_hours = "08:00" <= curr_hhmm <= "17:30"
+                should_patrol = False
+
+                if is_working_hours:
+                    if last_patrol_time is None:
+                        should_patrol = True
+                    else:
+                        elapsed = (now_jkt - last_patrol_time).total_seconds()
+                        if elapsed >= 3600:  # 60 minutes
+                            should_patrol = True
+
+                if should_patrol:
+                    last_patrol_time = now_jkt
+                    logger.info("Radar INAPROC: Memulai patroli otonom portal Mini Kompetisi E-Katalog v6...")
+                    found_competitions = await inaproc_agent.scan_and_alert_competitions(
+                        notify_wa=True,
+                        auto_submit=False,
+                    )
+                    logger.info(f"Radar INAPROC: Patroli selesai. {len(found_competitions)} paket tender terdeteksi/diperbarui.")
+            except Exception as ex:
+                logger.warning(f"Radar INAPROC: Error in procurement patrol ticker: {ex}")
+
+            if await _interruptible_sleep(60, stop_event):
+                break
+
+    procurement_ticker_task = asyncio.create_task(_procurement_scan_ticker())
+
+    async def _wa_live_sync_ticker():
+        """Fast-path realtime WhatsApp chat sync and instant auto-reply ticker (every 45s)."""
+        while not stop_event.is_set():
+            try:
+                wa_cfg = getattr(config.channels, "whatsapp", None)
+                if wa_cfg and wa_cfg.enabled and whatsapp.in_reply_hours():
+                    await whatsapp.sync_live_chats_from_openwa(limit=50)
+            except Exception as ex:
+                logger.debug(f"WhatsApp: Error in fast sync ticker: {ex}")
+            if await _interruptible_sleep(45, stop_event):
+                break
+
+    wa_sync_task = asyncio.create_task(_wa_live_sync_ticker())
+
+    async def _bigdata_maintenance_ticker():
+        """Background Big Data sync: rebuilds LanceDB every 6h and harvests 4 segments every 24h."""
+        from datetime import datetime, timezone
+        # Wait 90s after startup so initial heartbeat/WA sync settles first
+        if await _interruptible_sleep(90, stop_event):
+            return
+        while not stop_event.is_set():
+            try:
+                now_ts = datetime.now(timezone.utc).timestamp()
+
+                last_idx_raw = await state.get_setting("bigdata_last_index_ts")
+                last_idx = float(last_idx_raw) if last_idx_raw else 0.0
+                if (now_ts - last_idx) >= 6 * 3600:
+                    from harvey.integrations.big_data import MahoragaBigData
+                    res = await asyncio.to_thread(MahoragaBigData().build_all_indexes)
+                    await state.set_setting("bigdata_last_index_ts", str(now_ts))
+                    logger.info(
+                        f"BigData: Auto-sinkron LanceDB selesai ({res.get('total_indexed', 0)} rekaman, {res.get('elapsed_ms', 0)} ms)."
+                    )
+
+                last_harv_raw = await state.get_setting("bigdata_last_harvest_ts")
+                last_harv = float(last_harv_raw) if last_harv_raw else 0.0
+                if (now_ts - last_harv) >= 24 * 3600:
+                    from harvey.integrations.universe_harvester import UniverseHarvester
+                    hres = await UniverseHarvester().harvest_balanced_universe(max_per_segment=3)
+                    await state.set_setting("bigdata_last_harvest_ts", str(now_ts))
+                    logger.info(
+                        f"BigData: Auto-panen 4 segmen selesai (+{hres.get('total_inserted', 0)} prospek baru)."
+                    )
+            except Exception as ex:
+                logger.debug(f"BigData: Error in maintenance ticker: {ex}")
+            if await _interruptible_sleep(1800, stop_event):
+                break
+
+    bigdata_task = asyncio.create_task(_bigdata_maintenance_ticker())
 
     while not stop_event.is_set():
         try:
@@ -381,6 +531,10 @@ async def heartbeat(stop_event: asyncio.Event | None = None):
 
             if action == "handle_replies":
                 tasks.append(("handle_replies", handler.run()))
+                # Never starve Writer when verified email prospects are waiting
+                _, writable_now = _new_counts(summary)
+                if writable_now > 0:
+                    tasks.append(("write_campaign", writer.run()))
             elif action == "prospect":
                 tasks.append(("prospect", scout.run()))
                 # Also handle replies in parallel if needed
@@ -406,6 +560,8 @@ async def heartbeat(stop_event: asyncio.Event | None = None):
                 send_tasks.append(("send_campaign", sender.run))
             elif sender.is_native:
                 send_tasks.append(("send_outbox", sender.run))
+            if getattr(getattr(config.channels, "whatsapp", None), "enabled", False):
+                send_tasks.append(("send_whatsapp", whatsapp.run))
             if sender.is_native and not any(n == "handle_replies" for n, _ in tasks):
                 tasks.append(("read_replies", handler.run()))
 
@@ -471,6 +627,10 @@ async def heartbeat(stop_event: asyncio.Event | None = None):
             if await _interruptible_sleep(backoff, stop_event):
                 break
 
+    report_ticker_task.cancel()
+    procurement_ticker_task.cancel()
+    wa_sync_task.cancel()
+    bigdata_task.cancel()
     logger.info("Harvey shutting down. Deals don't close themselves, but I need a break.")
 
 
